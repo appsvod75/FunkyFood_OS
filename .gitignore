@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.env
+.env.local
+.env.production
+.env.development
+.env.staging
+*.db
+*.sqlite
+*.zip
+*.tar.gz
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+*.log

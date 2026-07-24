@@ -1,0 +1,2792 @@
+import express from 'express';
+import pool from './db.js';
+import { sendPushNotification } from './firebase-admin.js';
+
+const router = express.Router();
+
+// Helper to get all rows
+const query = async (sql, params) => {
+    const [rows, fields] = await pool.execute(sql, params);
+    return rows;
+};
+
+// AUTO-MIGRATION: Ensure received_by column exists
+(async () => {
+    const conn = await pool.getConnection();
+    try {
+        await conn.query("SELECT received_by FROM payments LIMIT 1");
+    } catch (e) {
+        if (e.code === 'ER_BAD_FIELD_ERROR') {
+            console.log('Migrating: Adding received_by column...');
+            await conn.query("ALTER TABLE payments ADD COLUMN received_by VARCHAR(255) DEFAULT 'Sistema'");
+        }
+    } finally {
+        conn.release();
+    }
+})();
+
+// AUTO-MIGRATION: Ensure delivery columns exist in orders
+(async () => {
+    const conn = await pool.getConnection();
+    try {
+        await conn.query("SELECT delivery_driver_id FROM orders LIMIT 1");
+    } catch (e) {
+        if (e.code === 'ER_BAD_FIELD_ERROR') {
+            console.log('Migrating: Adding delivery columns...');
+            try {
+                await conn.query("ALTER TABLE orders ADD COLUMN delivery_driver_id INT DEFAULT NULL"); // User ID of driver
+                await conn.query("ALTER TABLE orders ADD COLUMN delivery_status VARCHAR(50) DEFAULT 'pending'"); // pending, assigned, delivered
+                console.log('Added delivery columns to orders.');
+            } catch (alterErr) {
+                console.error('Failed to add delivery columns:', alterErr);
+            }
+        }
+    } finally {
+        conn.release();
+    }
+})();
+
+// AUTO-MIGRATION: Ensure birth_date column exists in customers
+(async () => {
+    const conn = await pool.getConnection();
+    try {
+        await conn.query(`SELECT birth_date FROM customers LIMIT 1`);
+    } catch (e) {
+        if (e.code === 'ER_BAD_FIELD_ERROR') {
+            console.log('Migrating: Adding birth_date column...');
+            await conn.query("ALTER TABLE customers ADD COLUMN birth_date DATE DEFAULT NULL");
+        }
+    } finally {
+        conn.release();
+    }
+})();
+
+const safeParams = (arr) => arr.map(v => (v === undefined || v === '') ? null : v);
+
+// AUTO-MIGRATION: Create promotions table
+(async () => {
+    const conn = await pool.getConnection();
+    try {
+        await conn.query("SELECT 1 FROM promotions LIMIT 1");
+    } catch (e) {
+        if (e.code === 'ER_NO_SUCH_TABLE') {
+            console.log('Migrating: Creating promotions table...');
+            try {
+                await conn.query(`
+                    CREATE TABLE promotions (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        name VARCHAR(100) NOT NULL,
+                        type VARCHAR(20) NOT NULL,
+                        start_date DATETIME,
+                        end_date DATETIME,
+                        days_of_week JSON,
+                        start_time TIME,
+                        end_time TIME,
+                        discount_type VARCHAR(20),
+                        discount_value DECIMAL(10, 2),
+                        target_type VARCHAR(20),
+                        target_ids JSON,
+                        trigger_quantity INT,
+                        combo_items JSON,
+                        is_active BOOLEAN DEFAULT TRUE,
+                        priority INT DEFAULT 0
+                    )
+                `);
+                console.log('Promotions table created.');
+            } catch (createErr) {
+                console.error('Failed to create promotions table:', createErr);
+            }
+        }
+    } finally {
+        conn.release();
+    }
+})();
+
+// AUTO-MIGRATION: Add birth_date to customers
+(async () => {
+    const conn = await pool.getConnection();
+    try {
+        await conn.query("SELECT birth_date FROM customers LIMIT 1");
+    } catch (e) {
+        if (e.code === 'ER_BAD_FIELD_ERROR') {
+            console.log('Migrating: Adding birth_date to customers...');
+            try {
+                await conn.query("ALTER TABLE customers ADD COLUMN birth_date DATE NULL");
+                console.log('Added birth_date to customers.');
+            } catch (alterErr) {
+                console.error('Failed to add birth_date:', alterErr);
+            }
+        }
+    } finally {
+        conn.release();
+    }
+})();
+
+
+// AUTO-MIGRATION: Create customer_feedback table
+(async () => {
+    const conn = await pool.getConnection();
+    try {
+        await conn.query("SELECT 1 FROM customer_feedback LIMIT 1");
+    } catch (e) {
+        if (e.code === 'ER_NO_SUCH_TABLE') {
+            console.log('Migrating: Creating customer_feedback table...');
+            try {
+                await conn.query(`
+                    CREATE TABLE customer_feedback (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        branch_id INT NOT NULL,
+                        rating INT NOT NULL COMMENT '1-5 Stars',
+                        comment TEXT,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (branch_id) REFERENCES branches(id)
+                    )
+                `);
+                console.log('Customer feedback table created.');
+            } catch (createErr) {
+                console.error('Failed to create customer_feedback table:', createErr);
+            }
+        }
+    } finally {
+        conn.release();
+    }
+})();
+
+// AUTO-MIGRATION: Create cash_closing_reports table
+(async () => {
+    const conn = await pool.getConnection();
+    try {
+        await conn.query("SELECT 1 FROM cash_closing_reports LIMIT 1");
+    } catch (e) {
+        if (e.code === 'ER_NO_SUCH_TABLE') {
+            console.log('Migrating: Creating cash_closing_reports table...');
+            try {
+                await conn.query(`
+                    CREATE TABLE cash_closing_reports (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        branch_id INT NOT NULL,
+                        date DATE NOT NULL,
+                        initial_cash DECIMAL(10, 2) DEFAULT 0,
+                        total_sales DECIMAL(10, 2) DEFAULT 0,
+                        total_cash_in DECIMAL(10, 2) DEFAULT 0,
+                        total_change_out DECIMAL(10, 2) DEFAULT 0,
+                        expected_cash DECIMAL(10, 2) DEFAULT 0,
+                        summary JSON,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE KEY unique_branch_date (branch_id, date),
+                        FOREIGN KEY (branch_id) REFERENCES branches(id)
+                    )
+                `);
+                console.log('Cash closing reports table created.');
+            } catch (createErr) {
+                console.error('Failed to create cash_closing_reports table:', createErr);
+            }
+        }
+    } finally {
+        conn.release();
+    }
+})();
+
+// AUTO-MIGRATION: Add ticket_width to branches
+(async () => {
+    const conn = await pool.getConnection();
+    try {
+        await conn.query("SELECT ticket_width FROM branches LIMIT 1");
+    } catch (e) {
+        if (e.code === 'ER_BAD_FIELD_ERROR') {
+            console.log('Migrating: Adding ticket_width to branches...');
+            try {
+                await conn.query("ALTER TABLE branches ADD COLUMN ticket_width VARCHAR(10) DEFAULT '80mm'");
+                console.log('Added ticket_width to branches.');
+            } catch (alterErr) {
+                console.error('Failed to add ticket_width:', alterErr);
+            }
+        }
+    } finally {
+        conn.release();
+    }
+})();
+
+// AUTO-MIGRATION: Add delivery fields to orders
+(async () => {
+    const conn = await pool.getConnection();
+    try {
+        await conn.query("SELECT delivery_driver_id FROM orders LIMIT 1");
+    } catch (e) {
+        if (e.code === 'ER_BAD_FIELD_ERROR') {
+            console.log('Migrating: Adding delivery fields to orders...');
+            try {
+                await conn.query("ALTER TABLE orders ADD COLUMN delivery_driver_id INT DEFAULT NULL");
+                await conn.query("ALTER TABLE orders ADD COLUMN delivery_status VARCHAR(50) DEFAULT 'pending'");
+                console.log('Added delivery fields.');
+            } catch (alterErr) {
+                console.error('Failed to add delivery fields:', alterErr);
+            }
+        }
+    } finally {
+        conn.release();
+    }
+})();
+
+// AUTO-MIGRATION: Create sales_goals table AND Update if missing columns
+(async () => {
+    const conn = await pool.getConnection();
+    try {
+        await conn.query("SELECT 1 FROM sales_goals LIMIT 1");
+
+        // Check for total_work_days column (Added in V2)
+        try {
+            await conn.query("SELECT total_work_days FROM sales_goals LIMIT 1");
+        } catch (e) {
+            if (e.code === 'ER_BAD_FIELD_ERROR') {
+                console.log('Migrating: Adding total_work_days to sales_goals...');
+                await conn.query("ALTER TABLE sales_goals ADD COLUMN total_work_days INT DEFAULT 30");
+                console.log('Added total_work_days to sales_goals.');
+            }
+        }
+
+    } catch (e) {
+        if (e.code === 'ER_NO_SUCH_TABLE') {
+            console.log('Migrating: Creating sales_goals table...');
+            try {
+                await conn.query(`
+                    CREATE TABLE sales_goals (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        branch_id INT NOT NULL,
+                        month_year VARCHAR(7) NOT NULL,
+                        target_amount DECIMAL(10, 2) NOT NULL DEFAULT 0,
+                        total_work_days INT DEFAULT 30,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        UNIQUE KEY unique_goal (branch_id, month_year),
+                        FOREIGN KEY (branch_id) REFERENCES branches(id)
+                    )
+                `);
+                console.log('Sales_goals table created.');
+            } catch (createErr) {
+                console.error('Failed to create sales_goals table:', createErr);
+            }
+        }
+    } finally {
+        conn.release();
+    }
+})();
+
+// AUTO-MIGRATION: Create app_config table and migrate Gemini API Key
+(async () => {
+    const conn = await pool.getConnection();
+    try {
+        // 1. Create app_config if it doesn't exist
+        try {
+            await conn.query("SELECT 1 FROM app_config LIMIT 1");
+        } catch (e) {
+            if (e.code === 'ER_NO_SUCH_TABLE') {
+                console.log('Migrating: Creating app_config table...');
+                await conn.query(`
+                    CREATE TABLE app_config (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        setting_key VARCHAR(100) NOT NULL UNIQUE,
+                        setting_value TEXT,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                    )
+                `);
+                console.log('app_config table created.');
+            }
+        }
+
+        // 2. Migrate Gemini API Key from branches to app_config
+        // Check if we already have it in app_config
+        const [existingConfig] = await conn.query("SELECT setting_value FROM app_config WHERE setting_key = 'gemini_api_key'");
+
+        if (existingConfig.length === 0) {
+            // Not in global config yet, try to find one in branches
+            try {
+                const [branches] = await conn.query("SELECT gemini_api_key FROM branches WHERE gemini_api_key IS NOT NULL AND gemini_api_key != '' LIMIT 1");
+                if (branches.length > 0 && branches[0].gemini_api_key) {
+                    console.log('Migrating: Moving Gemini API Key to global config...');
+                    await conn.query("INSERT INTO app_config (setting_key, setting_value) VALUES (?, ?)", ['gemini_api_key', branches[0].gemini_api_key]);
+
+                    // Optional: Clear from branches to avoid confusion? 
+                    // Better to keep for safety for now, or maybe the user wants to keep it there as fallback?
+                    // deciding to leave it in branches but ignore it in code is safer.
+                    console.log('Gemini API Key migrated to global config.');
+                }
+            } catch (err) {
+                // accessing branches might fail if column doesn't exist (e.g. fresh install), which is fine
+            }
+        }
+
+    } catch (err) {
+        console.error('Migration Error (app_config):', err);
+    } finally {
+        conn.release();
+    }
+})();
+
+// AUTO-MIGRATION: Add fcm_tokens to users
+(async () => {
+    const conn = await pool.getConnection();
+    try {
+        await conn.query("SELECT fcm_tokens FROM users LIMIT 1");
+    } catch (e) {
+        if (e.code === 'ER_BAD_FIELD_ERROR') {
+            console.log('Migrating: Adding fcm_tokens to users...');
+            try {
+                await conn.query("ALTER TABLE users ADD COLUMN fcm_tokens JSON DEFAULT NULL");
+                console.log('Added fcm_tokens to users.');
+            } catch (alterErr) {
+                console.error('Failed to add fcm_tokens:', alterErr);
+            }
+        }
+    } finally {
+        conn.release();
+    }
+})();
+
+// --- AUTH ---
+router.post('/login', async (req, res) => {
+    const { pin } = req.body;
+    try {
+        const users = await query('SELECT * FROM users WHERE pin = ? AND is_active = 1', [pin]);
+        console.log(`[LOGIN] Attempt PIN: ${pin}, Found: ${users.length} users.`); // Debug log
+        if (users.length > 0) {
+            const user = users[0];
+            // Normalize roles if stored as JSON
+            // user.roles is already an object/array if mysql2 casts JSON columns automatically (it usually does)
+            // If not, we might need JSON.parse(user.roles). 
+            // MySQL2 with 'typeCast' usually handles it, or we check typof.
+            if (typeof user.roles === 'string') {
+                try { user.roles = JSON.parse(user.roles); } catch (e) { }
+            }
+            // Map to camelCase for frontend
+            user.branchId = user.branch_id;
+            res.json(user);
+        } else {
+            res.status(401).json({ error: 'Invalid PIN' });
+        }
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// --- FEEDBACK (PUBLIC) ---
+router.post('/feedback', async (req, res) => {
+    const { branchId, rating, comment } = req.body;
+    try {
+        const result = await query(
+            'INSERT INTO customer_feedback (branch_id, rating, comment) VALUES (?, ?, ?)',
+            [branchId || 1, rating, comment]
+        );
+
+        // Emit Socket Event
+        const newFeedback = {
+            id: result.insertId,
+            branch_id: branchId || 1,
+            rating,
+            comment,
+            created_at: new Date()
+        };
+        req.io.emit('new_feedback', newFeedback);
+
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Feedback Error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// --- FEEDBACK (ADMIN) ---
+router.get('/feedback', async (req, res) => {
+    try {
+        // Simple fetch ordered by date
+        const feedback = await query('SELECT * FROM customer_feedback ORDER BY created_at DESC LIMIT 100');
+        res.json(feedback);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// --- PUSH NOTIFICATIONS ---
+router.post('/push/subscribe', async (req, res) => {
+    const { userId, token } = req.body;
+    console.log(`[PUSH] Intentando suscribir usuario ${userId} con token: ${token?.substring(0, 10)}...`);
+
+    if (!userId || !token) return res.status(400).json({ error: 'Missing userId or token' });
+
+    try {
+        const [user] = await query('SELECT fcm_tokens FROM users WHERE id = ?', [userId]);
+        if (!user) {
+            console.warn(`[PUSH] Usuario ${userId} no encontrado.`);
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        let tokens = [];
+        if (user.fcm_tokens) {
+            tokens = typeof user.fcm_tokens === 'string' ? JSON.parse(user.fcm_tokens) : user.fcm_tokens;
+        }
+
+        if (!tokens.includes(token)) {
+            tokens.push(token);
+            await query('UPDATE users SET fcm_tokens = ? WHERE id = ?', [JSON.stringify(tokens), userId]);
+            console.log(`[PUSH] Token guardado con éxito para usuario ${userId}.`);
+        } else {
+            console.log(`[PUSH] El token ya existía para el usuario ${userId}.`);
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error('[PUSH] Error en subscribe:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.post('/push/unsubscribe', async (req, res) => {
+    const { userId, token } = req.body;
+    if (!userId || !token) return res.status(400).json({ error: 'Missing userId or token' });
+
+    try {
+        const [user] = await query('SELECT fcm_tokens FROM users WHERE id = ?', [userId]);
+        if (!user) return res.status(404).json({ error: 'User not found' });
+
+        if (user.fcm_tokens) {
+            let tokens = typeof user.fcm_tokens === 'string' ? JSON.parse(user.fcm_tokens) : user.fcm_tokens;
+            const filtered = tokens.filter(t => t !== token);
+            await query('UPDATE users SET fcm_tokens = ? WHERE id = ?', [JSON.stringify(filtered), userId]);
+        }
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// --- PROMOTIONS ---
+router.get('/promotions', async (req, res) => {
+    try {
+        const promos = await query('SELECT * FROM promotions WHERE is_active = 1 ORDER BY priority DESC, id DESC');
+        // Parse JSON fields
+        const parsed = promos.map(p => ({
+            ...p,
+            days_of_week: typeof p.days_of_week === 'string' ? JSON.parse(p.days_of_week) : p.days_of_week,
+            target_ids: typeof p.target_ids === 'string' ? JSON.parse(p.target_ids) : p.target_ids,
+            combo_items: typeof p.combo_items === 'string' ? JSON.parse(p.combo_items) : p.combo_items,
+            isActive: !!p.is_active
+        }));
+        res.json(parsed);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.post('/promotions', async (req, res) => {
+    const {
+        name, type, start_date, end_date, days_of_week, start_time, end_time,
+        discount_type, discount_value, target_type, target_ids,
+        trigger_quantity, combo_items, is_active, isActive, priority, id
+    } = req.body;
+
+    // Fix: Frontend sends isActive, DB needs is_active.
+    // Fix: Frontend sends isActive, DB needs is_active.
+    const finalIsActive = is_active !== undefined ? is_active : (isActive !== undefined ? isActive : true);
+
+    const safeJson = (val) => val ? JSON.stringify(val) : null;
+
+    // Fix: Ensure dates are MySQL compatible (YYYY-MM-DD HH:mm:ss)
+    // We manually construct the string to PRESERVE the user's local input date/time 
+    // instead of converting to UTC (which might shift the day back/forward).
+    const formatDate = (d) => {
+        if (!d) return null;
+        // If d is already just "YYYY-MM-DD", append T12:00:00 to force it to be treated as a date, 
+        // but better yet, handle full date objects.
+        const date = new Date(d);
+        if (isNaN(date.getTime())) return null;
+
+        // Use local time methods
+        const pad = (n) => n.toString().padStart(2, '0');
+        const year = date.getFullYear();
+        const month = pad(date.getMonth() + 1);
+        const day = pad(date.getDate());
+        const hours = pad(date.getHours());
+        const minutes = pad(date.getMinutes());
+        const seconds = pad(date.getSeconds());
+
+        return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+    };
+
+    try {
+        if (id) {
+            // Update
+            await query(`
+                UPDATE promotions SET
+                    name=?, type=?, start_date=?, end_date=?, days_of_week=?, start_time=?, end_time=?,
+                    discount_type=?, discount_value=?, target_type=?, target_ids=?,
+                    trigger_quantity=?, combo_items=?, is_active=?, priority=?
+                WHERE id=?
+            `, [
+                name, type, formatDate(start_date), formatDate(end_date), safeJson(days_of_week), start_time || null, end_time || null,
+                discount_type, discount_value || 0, target_type, safeJson(target_ids),
+                trigger_quantity || 0, safeJson(combo_items), finalIsActive ? 1 : 0, priority || 0, id
+            ]);
+            res.json({ success: true, id });
+        } else {
+            // Insert
+            const result = await query(`
+                INSERT INTO promotions (
+                    name, type, start_date, end_date, days_of_week, start_time, end_time,
+                    discount_type, discount_value, target_type, target_ids,
+                    trigger_quantity, combo_items, is_active, priority
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `, [
+                name, type, formatDate(start_date), formatDate(end_date), safeJson(days_of_week), start_time || null, end_time || null,
+                discount_type, discount_value || 0, target_type, safeJson(target_ids),
+                trigger_quantity || 0, safeJson(combo_items), finalIsActive ? 1 : 0, priority || 0
+            ]);
+            res.json({ success: true, id: result.insertId });
+        }
+    } catch (err) {
+        console.error('Promotion Save Error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// --- CATEGORIES ---
+router.post('/categories', async (req, res) => {
+    const { name, sort_order } = req.body;
+    try {
+        const result = await query('INSERT INTO categories (name, sort_order) VALUES (?, ?)', [name, sort_order || 0]);
+        req.io.emit('catalog_updated');
+        res.json({ success: true, id: result.insertId });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.put('/categories/:id', async (req, res) => {
+    const { name, sort_order, is_active } = req.body;
+    try {
+        await query('UPDATE categories SET name = ?, sort_order = ?, is_active = ? WHERE id = ?', [name, sort_order || 0, is_active !== undefined ? is_active : 1, req.params.id]);
+        req.io.emit('catalog_updated');
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.delete('/categories/:id', async (req, res) => {
+    try {
+        await query('DELETE FROM categories WHERE id = ?', [req.params.id]);
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// --- MEATS (VARIANTS) ---
+router.post('/meats', async (req, res) => {
+    const { name, type } = req.body; // type: 'meat' | 'masa'
+    try {
+        const result = await query('INSERT INTO meats (name, type) VALUES (?, ?)', [name, type || 'meat']);
+        res.json({ success: true, id: result.insertId });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.put('/meats/:id', async (req, res) => {
+    const { name, type, is_active } = req.body;
+    try {
+        // Robust update: preserve existing values if missing in payload
+        const current = await query('SELECT * FROM meats WHERE id = ?', [req.params.id]);
+        if (current.length === 0) return res.status(404).json({ error: 'Not found' });
+
+        const finalName = name || current[0].name;
+        const finalType = type || current[0].type || 'meat';
+        const finalIsActive = is_active !== undefined ? is_active : current[0].is_active;
+
+        await query('UPDATE meats SET name = ?, type = ?, is_active = ? WHERE id = ?',
+            [finalName, finalType, finalIsActive, req.params.id]);
+
+        req.io.emit('catalog_updated');
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.delete('/meats/:id', async (req, res) => {
+    try {
+        await query('DELETE FROM meats WHERE id = ?', [req.params.id]);
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.delete('/promotions/:id', async (req, res) => {
+    try {
+        await query('UPDATE promotions SET is_active = 0 WHERE id = ?', [req.params.id]);
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// --- DATA FETCHING (STARTUP) ---
+router.get('/initial-data', async (req, res) => {
+    try {
+        const start = Date.now();
+
+        // Helper for robust startup - doesn't crash if a table is missing or migrating
+        const safeQuery = async (label, sql, params = []) => {
+            try {
+                const s = Date.now();
+                const result = await query(sql, params);
+                return result || [];
+            } catch (err) {
+                console.error(`[INITIAL-DATA] ERROR in ${label}:`, err.message);
+                return [];
+            }
+        };
+
+        const [
+            appConfig,
+            branches,
+            tables,
+            categories,
+            meats,
+            productExtras,
+            products,
+            customers,
+            users,
+            promotions,
+            cashClosingReports
+        ] = await Promise.all([
+            safeQuery('app_config', 'SELECT setting_key, setting_value FROM app_config'),
+            safeQuery('branches', 'SELECT * FROM branches'),
+            safeQuery('tables', 'SELECT * FROM tables'),
+            safeQuery('categories', 'SELECT * FROM categories ORDER BY sort_order ASC, name ASC'),
+            safeQuery('meats', 'SELECT * FROM meats'),
+            safeQuery('product_extras', 'SELECT * FROM product_extras'),
+            safeQuery('products', 'SELECT * FROM products'),
+            safeQuery('customers', 'SELECT * FROM customers'),
+            safeQuery('users', 'SELECT * FROM users WHERE is_active = 1'),
+            safeQuery('promotions', 'SELECT * FROM promotions WHERE is_active = 1 ORDER BY priority DESC'),
+            safeQuery('cashClosingReports', 'SELECT *, DATE_FORMAT(date, "%Y-%m-%d") as date FROM cash_closing_reports ORDER BY date DESC LIMIT 30')
+        ]);
+
+        const fetchDone = Date.now();
+
+        const globalSettings = appConfig.reduce((acc, row) => {
+            acc[row.setting_key] = row.setting_value;
+            return acc;
+        }, {});
+
+        console.log(`[INITIAL-DATA] Found ${users.length} active users.`);
+
+        // Map other fields
+        tables.forEach(t => t.branchId = t.branch_id);
+
+        // Populate customer addresses & Map birthDate (OPTIMIZED O(N+M) + SAFE)
+        const addresses = await safeQuery('customer_addresses', 'SELECT * FROM customer_addresses');
+        const addressMap = {};
+        addresses.forEach(addr => {
+            if (!addressMap[addr.customer_id]) addressMap[addr.customer_id] = [];
+            addressMap[addr.customer_id].push(addr);
+        });
+
+        customers.forEach(c => {
+            c.addresses = addressMap[c.id] || [];
+            if (c.birth_date) {
+                try {
+                    c.birthDate = new Date(c.birth_date).toISOString().split('T')[0];
+                } catch (e) {
+                    c.birthDate = c.birth_date;
+                }
+            }
+        });
+
+        const processingDone = Date.now();
+        console.log(`[INITIAL-DATA] Done. Fetch: ${fetchDone - start}ms, Processing: ${processingDone - fetchDone}ms. Total: ${processingDone - start}ms.`);
+
+        // Map branches to camelCase
+        const mappedBranches = branches.map(b => ({
+            ...b,
+            isActive: !!b.is_active,
+            autoCloseTime: b.auto_close_time,
+            autoCloseEnabled: !!b.auto_close_enabled,
+            ticketWidth: b.ticket_width,
+            gasWebhookUrl: b.gas_webhook_url,
+            geminiApiKey: b.gemini_api_key,
+            logoUrl: b.logo_url
+        }));
+
+        // Map users (waiters)
+        const mappedUsers = users.map(u => {
+            let roles = u.roles;
+            if (typeof roles === 'string') {
+                try { roles = JSON.parse(roles); } catch (e) { }
+            }
+            return {
+                ...u,
+                branchId: u.branch_id,
+                isActive: !!u.is_active,
+                roles: roles
+            };
+        });
+
+        // Parse promotions
+        const mappedPromotions = promotions.map(p => ({
+            ...p,
+            days_of_week: typeof p.days_of_week === 'string' ? JSON.parse(p.days_of_week) : p.days_of_week,
+            target_ids: typeof p.target_ids === 'string' ? JSON.parse(p.target_ids) : p.target_ids,
+            combo_items: typeof p.combo_items === 'string' ? JSON.parse(p.combo_items) : p.combo_items,
+            isActive: !!p.is_active
+        }));
+
+        // Map product extras
+        const mappedProductExtras = productExtras.map(pe => ({
+            ...pe,
+            isActive: !!pe.is_active
+        }));
+
+        // Map categories
+        const mappedCategories = categories.map(c => ({
+            ...c,
+            isActive: c.is_active !== 0
+        }));
+
+        // Map meats (Meats & Masas)
+        const mappedMeats = meats.map(m => ({
+            ...m,
+            isActive: m.is_active !== 0
+        }));
+
+        // Map products - ONE SINGLE CONSOLIDATED MAPPING
+        const mappedProducts = products.map(p => {
+            let availableExtras = p.available_extras;
+            if (typeof availableExtras === 'string') {
+                try { availableExtras = JSON.parse(availableExtras); } catch (e) { availableExtras = []; }
+            }
+
+            return {
+                id: p.id,
+                name: p.name,
+                price: p.price,
+                categoryId: p.category_id,
+                requiresMeat: !!p.requires_meat,
+                requiresMasa: !!p.requires_masa,
+                availableExtraIds: Array.isArray(availableExtras) ? availableExtras : [],
+                isActive: p.is_active !== 0,
+                is_active: p.is_active // redundant field for legacy frontend logic if any
+            };
+        });
+
+        // Map cash closing reports
+        const mappedClosingReports = cashClosingReports.map(r => ({
+            ...r,
+            branchId: r.branch_id,
+            initialCash: r.initial_cash,
+            totalSales: r.total_sales,
+            totalCashIn: r.total_cash_in,
+            totalChangeOut: r.total_change_out,
+            expectedCash: r.expected_cash,
+            summary: typeof r.summary === 'string' ? JSON.parse(r.summary) : r.summary,
+            createdAt: r.created_at,
+            updates_count: r.updates_count || 0
+        }));
+
+        res.json({
+            cashClosingReports: mappedClosingReports, // Added correctly
+            branches: mappedBranches,
+            tables,
+            categories: mappedCategories,
+            meats: mappedMeats,
+            productExtras: mappedProductExtras,
+            products: mappedProducts,
+            customers,
+            waiters: mappedUsers,
+            promotions: mappedPromotions,
+            globalSettings
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// --- ORDERS ---
+router.get('/orders', async (req, res) => {
+    const { branchId, status, startDate, endDate, limit } = req.query;
+    try {
+        let sql = 'SELECT * FROM orders WHERE 1=1';
+        const params = [];
+        if (branchId) {
+            sql += ' AND branch_id = ?';
+            params.push(parseInt(branchId));
+        }
+
+        // SMART FILTER (Default Load): If no specific filters, show Active OR Today's Completed
+        if (!status && !startDate && !endDate && !limit) {
+            sql += " AND (status != 'completed' OR (status = 'completed' AND DATE(created_at) = CURDATE()))";
+        } else {
+            // Apply standard filters if provided
+            if (status) { // 'active' or 'completed'
+                sql += ' AND status = ?';
+                params.push(status);
+            }
+            if (startDate) {
+                sql += ' AND created_at >= ?';
+                params.push(startDate + ' 00:00:00');
+            }
+            if (endDate) {
+                sql += ' AND created_at <= ?';
+                params.push(endDate + ' 23:59:59');
+            }
+        }
+
+        // Ordering
+        sql += ' ORDER BY created_at DESC';
+
+        if (limit) {
+            sql += ' LIMIT ?';
+            params.push(parseInt(limit));
+        } else if (status === 'completed' && !startDate) {
+            // Only limit if looking at history without specific date dates
+            sql += ' LIMIT 50';
+        }
+
+        const orders = await query(sql, params);
+
+
+        if (orders.length > 0) {
+            const orderIds = orders.map(o => o.id);
+            const placeholders = orderIds.map(() => '?').join(',');
+
+            // 1. Get Items
+            const items = await query(`SELECT * FROM order_items WHERE order_id IN (${placeholders})`, orderIds);
+
+            // 2. Get Extras with Names and Prices
+            let extras = [];
+            if (items.length > 0) {
+                const itemIds = items.map(i => i.id);
+                const itemPlaceholders = itemIds.map(() => '?').join(',');
+                if (itemIds.length > 0) {
+                    extras = await query(
+                        `SELECT oie.*, pe.name, pe.price 
+                         FROM order_item_extras oie 
+                         LEFT JOIN product_extras pe ON oie.extra_id = pe.id 
+                         WHERE oie.order_item_id IN (${itemPlaceholders})`,
+                        itemIds
+                    );
+                }
+            }
+
+            // 3. Get Payments
+            const payments = await query(`SELECT * FROM payments WHERE order_id IN (${placeholders})`, orderIds);
+
+            // 4. Get Customers & Addresses
+            let customers = [];
+            const customerIds = [...new Set(orders.map(o => o.customer_id).filter(id => id))];
+            if (customerIds.length > 0) {
+                const customerPlaceholders = customerIds.map(() => '?').join(',');
+                customers = await query(`SELECT * FROM customers WHERE id IN (${customerPlaceholders})`, customerIds);
+
+                const addresses = await query(`SELECT * FROM customer_addresses WHERE customer_id IN (${customerPlaceholders})`, customerIds);
+                customers.forEach(c => {
+                    c.addresses = addresses.filter(a => a.customer_id === c.id);
+                });
+            }
+
+            // 5. Get Products (Safe Hydration)
+            let products = [];
+            try {
+                const productIds = [...new Set(items.map(i => i.product_id).filter(id => id))];
+                if (productIds.length > 0) {
+                    const productPlaceholders = productIds.map(() => '?').join(',');
+                    products = await query(`SELECT * FROM products WHERE id IN (${productPlaceholders})`, productIds);
+                }
+            } catch (err) {
+                console.error("Product hydration failed:", err);
+            }
+
+            // Map everything
+            orders.forEach(o => {
+                o.items = items.filter(i => i.order_id === o.id).map(i => {
+                    const myExtras = extras.filter(e => e.order_item_id === i.id).map(e => ({
+                        id: e.extra_id,
+                        name: e.name || 'Extra Eliminado/Desc.',
+                        price: e.price !== null ? parseFloat(e.price) : 0
+                    }));
+                    const product = products.find(p => p.id === i.product_id);
+                    return {
+                        ...i,
+                        total: parseFloat(i.total),
+                        completed: !!i.completed,
+                        extras: myExtras,
+                        productId: i.product_id,
+                        meatId: i.meat_id,
+                        masaId: i.masa_id,
+                        product: product ? {
+                            id: product.id,
+                            name: product.name,
+                            price: parseFloat(product.price),
+                            categoryId: product.category_id
+                        } : { name: 'Producto Desconocido' }
+                    };
+                });
+
+                // Attach Customer
+                if (o.customer_id) {
+                    const c = customers.find(cust => cust.id === o.customer_id);
+                    if (c) {
+                        o.customer = {
+                            id: c.id,
+                            name: c.name,
+                            phone: c.phone,
+                            email: c.email,
+                            notes: c.notes,
+                            addresses: c.addresses || []
+                        };
+                    }
+                }
+
+                // Map camelCase
+                o.branchId = o.branch_id;
+                o.createdAt = o.created_at;
+                o.kitchenStatus = o.kitchen_status;
+                o.dailyOrderNumber = o.daily_order_number;
+                o.deliveryFee = parseFloat(o.delivery_fee || 0);
+                o.total = parseFloat(o.total);
+                o.amountPaid = parseFloat(o.amount_paid || 0);
+                o.deliveryDriverId = o.delivery_driver_id;
+                o.deliveryStatus = o.delivery_status || 'pending';
+                o.deliveryAddressId = o.delivery_address_id;
+
+                // Hydrate deliveryAddress object
+                if (o.deliveryAddressId && o.customer?.addresses) {
+                    o.deliveryAddress = o.customer.addresses.find(a => a.id === o.deliveryAddressId);
+                }
+
+                // Payments
+                o.payments = payments.filter(p => p.order_id === o.id).map(p => ({
+                    ...p,
+                    amount: parseFloat(p.amount),
+                    receivedBy: p.received_by
+                }));
+            });
+        }
+
+        res.json(orders);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// --- GLOBAL HISTORY ENDPOINT ---
+router.get('/orders/history', async (req, res) => {
+    try {
+        const { startDate, endDate, search, limit = 50, offset = 0, branchId } = req.query;
+        let sql = '';
+        const params = [];
+
+        // Base SELECT for both valid queries
+        const baseSelect = `
+            SELECT o.*, c.name as customer_name, c.phone as customer_phone, w.name as waiter_name
+            FROM orders o
+            LEFT JOIN customers c ON o.customer_id = c.id
+            LEFT JOIN users w ON o.waiter_id = w.id
+            WHERE 1=1
+        `;
+
+        if (search) {
+            // --- COMPLEX SEARCH QUERY ---
+            const searchTerm = `%${search}%`;
+            sql = baseSelect;
+
+            if (branchId) {
+                sql += ' AND o.branch_id = ?';
+                params.push(branchId);
+            }
+            if (startDate && endDate) {
+                sql += ' AND o.created_at BETWEEN ? AND ?';
+                params.push(startDate, endDate);
+            }
+
+            sql += ` AND o.status = 'completed' AND (
+                o.id LIKE ? OR 
+                o.daily_order_number LIKE ? OR
+                c.name LIKE ? OR 
+                c.phone LIKE ?
+            )`;
+            params.push(searchTerm, searchTerm, searchTerm, searchTerm);
+
+            sql += ' ORDER BY o.created_at DESC LIMIT ' + parseInt(limit) + ' OFFSET ' + parseInt(offset);
+
+        } else {
+            // --- SIMPLE QUERY (NOW WITH JOINS) ---
+            sql = baseSelect + " AND o.status = 'completed'";
+
+            if (branchId) {
+                sql += ' AND o.branch_id = ?';
+                params.push(parseInt(branchId));
+            }
+            if (startDate && endDate) {
+                sql += ' AND o.created_at BETWEEN ? AND ?';
+                params.push(startDate, endDate);
+            }
+
+            sql += ' ORDER BY o.created_at DESC LIMIT ' + parseInt(limit) + ' OFFSET ' + parseInt(offset);
+        }
+
+        const orders = await query(sql, params);
+
+        // Fetch details for these orders (Items, Payments)
+        // Similar hydration as GET /orders but maybe lighter?
+        // Cloning NEEDS full details (items, meat, extras). 
+        if (orders.length > 0) {
+            const orderIds = orders.map(o => o.id);
+            const placeholders = orderIds.map(() => '?').join(',');
+
+            // Items
+            const items = await query(`SELECT * FROM order_items WHERE order_id IN (${placeholders})`, orderIds);
+
+            // Extras
+            let extras = [];
+            if (items.length > 0) {
+                const itemIds = items.map(i => i.id);
+                if (itemIds.length > 0) {
+                    const itemPlaces = itemIds.map(() => '?').join(',');
+                    extras = await query(`SELECT * FROM order_item_extras WHERE order_item_id IN (${itemPlaces})`, itemIds);
+                }
+            }
+
+            // Payments
+            const payments = await query(`SELECT * FROM payments WHERE order_id IN (${placeholders})`, orderIds);
+
+            // Customers (if not joined above, but we joined for search. Does not hurt to hydrate object)
+            // If we joined, we have name/phone in 'o'. But 'customer' object structure is expected by frontend.
+            // Let's re-fetch full customer object to be safe and consistent with types.
+            const customerIds = [...new Set(orders.map(o => o.customer_id).filter(id => id))];
+            let customers = [];
+            if (customerIds.length > 0) {
+                const custPlaces = customerIds.map(() => '?').join(',');
+                customers = await query(`SELECT * FROM customers WHERE id IN (${custPlaces})`, customerIds);
+            }
+
+            // Products (Needed because order_items only has IDs)
+            const productIds = [...new Set(items.map(i => i.product_id))];
+            let products = [];
+            if (productIds.length > 0) {
+                const prodPlaces = productIds.map(() => '?').join(',');
+                products = await query(`SELECT * FROM products WHERE id IN (${prodPlaces})`, productIds);
+            }
+
+            // Map it all
+            orders.forEach(o => {
+                o.items = items.filter(i => i.order_id === o.id).map(i => {
+                    const myExtras = extras.filter(e => e.order_item_id === i.id).map(e => ({ id: e.extra_id }));
+                    const product = products.find(p => p.id === i.product_id);
+                    return {
+                        ...i,
+                        total: parseFloat(i.total),
+                        completed: !!i.completed,
+                        extras: myExtras,
+                        productId: i.product_id,
+                        meatId: i.meat_id,
+                        product: product ? { ...product, price: parseFloat(product.price) } : undefined
+                    };
+                });
+
+                if (o.customer_id) {
+                    const c = customers.find(cust => cust.id === o.customer_id);
+                    if (c) {
+                        o.customer = {
+                            id: c.id,
+                            name: c.name,
+                            phone: c.phone,
+                            email: c.email,
+                            notes: c.notes || ''
+                        };
+                    }
+                }
+
+                o.branchId = o.branch_id;
+                o.createdAt = o.created_at;
+                o.kitchenStatus = o.kitchen_status;
+                o.dailyOrderNumber = o.daily_order_number;
+                o.deliveryFee = parseFloat(o.delivery_fee || 0);
+                o.total = parseFloat(o.total);
+                o.amountPaid = parseFloat(o.amount_paid || 0);
+                o.changeGiven = parseFloat(o.change_given || 0);
+
+                o.payments = payments.filter(p => p.order_id === o.id).map(p => ({
+                    ...p,
+                    amount: parseFloat(p.amount),
+                    receivedBy: p.received_by
+                }));
+
+                // Calculate amountPaid if DB is 0 but payments exist
+                if (o.amountPaid === 0 && o.payments.length > 0) {
+                    o.amountPaid = o.payments.reduce((sum, p) => sum + p.amount, 0);
+                    // Also estimate change given? Usually Total - Paid. 
+                    // But if amountPaid is calculated, Change = AmountPaid - Total.
+                    o.changeGiven = Math.max(0, o.amountPaid - o.total);
+                }
+            });
+        }
+
+        res.json(orders);
+    } catch (err) {
+        console.error('Error fetching history:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// --- SPECIALIZED DELIVERY HISTORY (For DeliveryDashboard) ---
+router.get('/delivery/history', async (req, res) => {
+    try {
+        const { startDate, endDate, branchId } = req.query;
+        let sql = "SELECT * FROM orders WHERE type = 'Delivery' AND (status = 'completed' OR delivery_status = 'delivered')";
+        const params = [];
+
+        if (branchId) {
+            sql += ' AND branch_id = ?';
+            params.push(parseInt(branchId));
+        }
+
+        if (startDate && endDate) {
+            sql += ' AND created_at BETWEEN ? AND ?';
+            params.push(startDate + ' 00:00:00', endDate + ' 23:59:59');
+        }
+
+        sql += ' ORDER BY created_at DESC LIMIT 100';
+
+        const orders = await query(sql, params);
+
+        if (orders.length > 0) {
+            const orderIds = orders.map(o => o.id);
+            const placeholders = orderIds.map(() => '?').join(',');
+
+            // 1. Items
+            const items = await query(`SELECT * FROM order_items WHERE order_id IN (${placeholders})`, orderIds);
+
+            // 2. Extras with Names and Prices
+            let extras = [];
+            if (items.length > 0) {
+                const itemIds = items.map(i => i.id);
+                const itemPlaceholders = itemIds.map(() => '?').join(',');
+                extras = await query(
+                    `SELECT oie.*, pe.name, pe.price 
+                     FROM order_item_extras oie 
+                     LEFT JOIN product_extras pe ON oie.extra_id = pe.id 
+                     WHERE oie.order_item_id IN (${itemPlaceholders})`,
+                    itemIds
+                );
+            }
+
+            // 3. Meats
+            const meats = await query('SELECT * FROM meats');
+
+            // 4. Products
+            let products = [];
+            const productIds = [...new Set(items.map(i => i.product_id).filter(id => id))];
+            if (productIds.length > 0) {
+                const productPlaceholders = productIds.map(() => '?').join(',');
+                products = await query(`SELECT * FROM products WHERE id IN (${productPlaceholders})`, productIds);
+            }
+
+            // 5. Customers & Addresses
+            const customerIds = [...new Set(orders.map(o => o.customer_id).filter(id => id))];
+            let customers = [];
+            if (customerIds.length > 0) {
+                const custPlaces = customerIds.map(() => '?').join(',');
+                customers = await query(`SELECT * FROM customers WHERE id IN (${custPlaces})`, customerIds);
+
+                const addresses = await query(`SELECT * FROM customer_addresses WHERE customer_id IN (${custPlaces})`, customerIds);
+                customers.forEach(c => {
+                    c.addresses = addresses.filter(a => a.customer_id === c.id);
+                });
+            }
+
+            orders.forEach(o => {
+                // Map items with full hydration
+                o.items = items.filter(i => i.order_id === o.id).map(i => {
+                    const myExtras = extras.filter(e => e.order_item_id === i.id).map(e => ({
+                        id: e.extra_id,
+                        name: e.name || 'Extra Eliminado/Desc.',
+                        price: e.price !== null ? parseFloat(e.price) : 0
+                    }));
+                    const product = products.find(p => p.id === i.product_id);
+                    const meat = meats.find(m => m.id === i.meat_id);
+
+                    return {
+                        ...i,
+                        total: parseFloat(i.total),
+                        productId: i.product_id,
+                        meatId: i.meat_id,
+                        notes: i.observations, // Map observations to notes for frontend consistency
+                        meat: meat ? { id: meat.id, name: meat.name } : null,
+                        product: product ? {
+                            id: product.id,
+                            name: product.name,
+                            price: parseFloat(product.price),
+                            categoryId: product.category_id
+                        } : { name: 'Producto Desconocido' },
+                        productName: product ? product.name : 'Producto Desconocido' // Direct productName for easier display
+                    };
+                });
+
+                if (o.customer_id) {
+                    const c = customers.find(cust => cust.id === o.customer_id);
+                    if (c) {
+                        o.customer = {
+                            id: c.id,
+                            name: c.name,
+                            phone: c.phone,
+                            addresses: c.addresses || []
+                        };
+                    }
+                }
+                // CamelCase
+                o.branchId = o.branch_id;
+                o.createdAt = o.created_at;
+                o.deliveryStatus = o.delivery_status;
+                o.deliveryDriverId = o.delivery_driver_id;
+                o.total = parseFloat(o.total);
+                o.deliveryFee = parseFloat(o.delivery_fee || 0);
+                o.dailyOrderNumber = o.daily_order_number;
+                o.deliveryAddressId = o.delivery_address_id;
+
+                // Hydrate deliveryAddress object
+                if (o.deliveryAddressId && o.customer?.addresses) {
+                    o.deliveryAddress = o.customer.addresses.find(a => a.id === o.deliveryAddressId);
+                }
+            });
+        }
+
+        res.json(orders);
+    } catch (err) {
+        console.error(err);
+        if (conn) await conn.rollback();
+        res.status(500).json({ error: err.message, sqlMessage: err.sqlMessage }); // detailed error
+    }
+});
+
+router.post('/orders', async (req, res) => {
+    const order = req.body;
+    console.log(`[POST /orders] Recibido: ID=${order.id}, Tipo=${order.type}, Branch=${order.branchId}`);
+    const conn = await pool.getConnection();
+    try {
+        await conn.beginTransaction();
+
+        // Calculate Next Daily Order Number Safe from Race Conditions
+        // We use FOR UPDATE to lock if necessary, though simpler select max works if transaction isolation is SERIALIZABLE.
+        // For standard isolation (REPEATABLE READ), explicit locking or simple selection is usually fine in low volume, 
+        // but let's do a SELECT... FOR UPDATE on a dummy row or just rely on the insert. 
+        // Best approach for MySQL simple counter:
+
+        const [rows] = await conn.execute(
+            `SELECT MAX(daily_order_number) as maxNum 
+             FROM orders 
+             WHERE branch_id = ? 
+             AND DATE(created_at) = CURDATE() FOR UPDATE`,
+            [order.branchId]
+        );
+
+        const nextDailyOrderNumber = (rows[0].maxNum || 0) + 1;
+
+        // Insert Order
+        await conn.execute(
+            `INSERT INTO orders (id, branch_id, daily_order_number, type, status, kitchen_status, subtotal, tax, discount, delivery_fee, total, created_at, waiter_id, table_id, customer_id, delivery_address_id, amount_paid, change_given)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+                order.id,
+                order.branchId,
+                nextDailyOrderNumber,
+                order.type,
+                order.status,
+                order.kitchenStatus,
+                order.subtotal || 0,
+                order.tax || 0,
+                order.discount || 0,
+                order.deliveryFee || 0,
+                order.total || 0,
+                new Date(order.createdAt),
+                order.waiter ? order.waiter.id : null,
+                order.table ? order.table.id : null,
+                order.customer ? order.customer.id : null,
+                order.deliveryAddress ? order.deliveryAddress.id : (order.deliveryAddressId || null),
+                order.amountPaid || 0,
+                order.changeGiven || 0
+            ]
+        );
+
+        // Insert Items
+        for (const item of order.items) {
+            await conn.execute(
+                `INSERT INTO order_items (id, order_id, product_id, quantity, meat_id, masa_id, total, observations, completed)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [item.id, order.id, item.product.id, item.quantity, item.meat ? item.meat.id : null, item.masaId || (item.masa ? item.masa.id : null), item.total || 0, item.observations || null, item.completed ? 1 : 0]
+            );
+
+            // Insert Extras
+            if (item.extras && Array.isArray(item.extras) && item.extras.length > 0) {
+                for (const extra of item.extras) {
+                    await conn.execute(
+                        `INSERT INTO order_item_extras (order_item_id, extra_id) VALUES (?, ?)`,
+                        [item.id, extra.id || extra]
+                    );
+                }
+            }
+        }
+        console.log(`[PUT-TRACE] 3. Items sincronizados.`);
+
+        await conn.commit();
+        console.log(`[PUT-TRACE] 4. Transacción confirmada (COMMIT).`);
+
+        // Notify via Socket
+        // IMPORTANT: Emit the order with the CORRECT server-generated dailyOrderNumber
+        const finalOrder = { ...order, dailyOrderNumber: nextDailyOrderNumber };
+        req.io.emit('new_order', finalOrder); // Broadcast to all (kitchen, other waiters)
+
+        // --- PUSH NOTIFICATION FOR DELIVERY DRIVERS (Instant) ---
+        const lowerType = (order.type || '').toLowerCase();
+        console.log(`[PUSH-POST-DEBUG] Tipo detectado: ${order.type} (Normalizado: ${lowerType})`);
+        if (lowerType === 'delivery') {
+            console.log(`[PUSH-POST] Detectada orden de delivery: ${order.id}. Iniciando notificación...`);
+            (async () => {
+                try {
+                    const bId = order.branch_id || order.branchId;
+                    console.log(`[PUSH-POST] Buscando repartidores para Branch: ${bId}`);
+
+                    // Query using JSON_CONTAINS for robust role checking
+                    const drivers = await query(
+                        "SELECT id, name, fcm_tokens, roles FROM users WHERE branch_id = ? AND is_active = 1 AND (JSON_CONTAINS(roles, '\"Repartidor\"') OR JSON_CONTAINS(roles, '\"repartidor\"')) AND fcm_tokens IS NOT NULL",
+                        [bId]
+                    );
+
+                    console.log(`[PUSH] Repartidores encontrados: ${drivers.length}`);
+
+                    let tokens = [];
+                    drivers.forEach(d => {
+                        let t = d.fcm_tokens;
+                        if (typeof t === 'string' && t !== '') {
+                            try { t = JSON.parse(t); } catch (e) { t = [t]; }
+                        }
+                        if (Array.isArray(t)) {
+                            console.log(`[PUSH] User ${d.id} (${d.name}): ${t.length} tokens`);
+                            tokens = tokens.concat(t.filter(tk => typeof tk === 'string' && tk.length > 20));
+                        }
+                    });
+
+                    if (tokens.length > 0) {
+                        const orderNum = String(nextDailyOrderNumber).padStart(3, '0');
+                        await sendPushNotification(tokens, `🔥 ¡NUEVO ENVÍO!`, `Orden #${orderNum} lista para ser tomada. 🛵💨`, {
+                            orderId: order.id,
+                            type: 'delivery_new',
+                            url: '/delivery',
+                            click_action: '/delivery'
+                        }, [
+                            { action: 'open_app', title: '🚀 VER PEDIDO' }
+                        ]);
+                        console.log(`[PUSH] Firebase Result:`, 'Success ✅');
+                    } else {
+                        console.log('[PUSH] No active drivers with tokens found.');
+                    }
+                } catch (pushErr) {
+                    console.error('[PUSH ERROR] Instant delivery notification failed:', pushErr);
+                }
+            })();
+        }
+
+        res.status(201).json({ message: 'Order created', dailyOrderNumber: nextDailyOrderNumber });
+    } catch (err) {
+        await conn.rollback();
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    } finally {
+        conn.release();
+    }
+});
+
+router.put('/orders/:id', async (req, res) => {
+    const { id } = req.params;
+    const updates = req.body;
+
+    // DEBUG: Log updates
+    console.log(`[PUT /orders/${id}] Payload received:`, JSON.stringify(updates));
+
+    if (updates.items) {
+        console.log(`[PUT /orders/${id}] Items count: ${updates.items.length}`);
+        updates.items.forEach((item, idx) => {
+            console.log(`  Item ${idx} (${item.product?.name || item.id}): Extras = ${JSON.stringify(item.extras)}`);
+        });
+    }
+
+    const conn = await pool.getConnection();
+    try {
+        await conn.beginTransaction();
+
+        // 1. Update Order Fields (Status, Totals, etc)
+        const fields = [];
+        const values = [];
+
+        // Allow updating standard fields
+        if (updates.type) { fields.push('type = ?'); values.push(updates.type); }
+        if (updates.status) { fields.push('status = ?'); values.push(updates.status); }
+        if (updates.kitchenStatus) {
+            fields.push('kitchen_status = ?');
+            values.push(updates.kitchenStatus);
+
+            if (updates.kitchenStatus === 'ready') {
+                fields.push('ready_at = NOW()');
+                // Force update even if status hasn't changed to trigger socket
+                fields.push('updated_at = NOW()');
+            }
+        }
+        if (updates.deliveryDriverId !== undefined) { fields.push('delivery_driver_id = ?'); values.push(updates.deliveryDriverId); }
+        if (updates.deliveryStatus !== undefined) { fields.push('delivery_status = ?'); values.push(updates.deliveryStatus); }
+
+        // Handle both flat IDs and objects (Frontend sends objects for customer, table, waiter)
+        const customerId = updates.customerId || updates.customer?.id;
+        if (customerId !== undefined) { fields.push('customer_id = ?'); values.push(customerId); }
+
+        const tableId = updates.tableId || updates.table?.id;
+        if (tableId !== undefined) { fields.push('table_id = ?'); values.push(tableId); }
+
+        const waiterId = updates.waiterId || updates.waiter?.id;
+        if (waiterId !== undefined) { fields.push('waiter_id = ?'); values.push(waiterId); }
+
+        const deliveryAddressId = updates.deliveryAddressId || updates.deliveryAddress?.id;
+        if (deliveryAddressId !== undefined) { fields.push('delivery_address_id = ?'); values.push(deliveryAddressId); }
+
+        // Allow updating totals (Frontend calculates these)
+        if (updates.total !== undefined) { fields.push('total = ?'); values.push(updates.total); }
+        if (updates.subtotal !== undefined) { fields.push('subtotal = ?'); values.push(updates.subtotal); }
+        if (updates.tax !== undefined) { fields.push('tax = ?'); values.push(updates.tax); }
+        if (updates.discount !== undefined) { fields.push('discount = ?'); values.push(updates.discount); }
+        if (updates.deliveryFee !== undefined) { fields.push('delivery_fee = ?'); values.push(updates.deliveryFee); }
+        if (updates.completedAt !== undefined) {
+            const val = updates.completedAt ? new Date(updates.completedAt) : null;
+            fields.push('completed_at = ?');
+            values.push(val);
+        }
+        if (updates.amountPaid !== undefined) { fields.push('amount_paid = ?'); values.push(updates.amountPaid); }
+        if (updates.changeGiven !== undefined) { fields.push('change_given = ?'); values.push(updates.changeGiven); }
+
+        if (fields.length > 0) {
+            values.push(id);
+            console.log(`[PUT-TRACE] 1. Actualizando tabla orders...`);
+            await conn.execute(`UPDATE orders SET ${fields.join(', ')} WHERE id = ?`, values);
+            console.log(`[PUT-TRACE] 2. Tabla orders actualizada.`);
+        }
+
+        // 2. Sync Items (If provided) - Full Replace Strategy
+        if (updates.items && Array.isArray(updates.items)) {
+            // A. Delete existing extras (via cascade usually, but manual is safer if FK naming varies)
+            // Actually constraint fk_items_order ON DELETE CASCADE handles items deletion, 
+            // but we need to delete items first.
+            // However, fetching IDs to delete specific extras is slow. 
+            // Easiest: DELETE FROM order_items WHERE order_id = ?
+            // The extras attached to these items will be deleted by ON DELETE CASCADE in `order_item_extras`.
+            await conn.execute('DELETE FROM order_items WHERE order_id = ?', [id]);
+
+            // B. Insert New Items
+            for (const item of updates.items) {
+                await conn.execute(
+                    `INSERT INTO order_items (id, order_id, product_id, quantity, meat_id, masa_id, total, observations, completed)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    [
+                        item.id,
+                        id,
+                        item.product.id || item.productId, // Handle both object and flattened ID
+                        item.quantity,
+                        item.meat ? item.meat.id : (item.meatId || null),
+                        item.masaId || (item.masa ? item.masa.id : null),
+                        item.total,
+                        item.observations || null,
+                        item.completed ? 1 : 0
+                    ]
+                );
+
+                // C. Insert Extras for this Item
+                if (item.extras && Array.isArray(item.extras) && item.extras.length > 0) {
+                    for (const extra of item.extras) {
+                        await conn.execute(
+                            `INSERT INTO order_item_extras (order_item_id, extra_id) VALUES (?, ?)`,
+                            [item.id, extra.id || extra]
+                        );
+                    }
+                }
+            }
+        }
+
+        // 3. Sync Payments (If provided)
+        if (updates.payments && Array.isArray(updates.payments) && updates.payments.length > 0) {
+            // For now, we only add new payments, or we could replace all. 
+            // Safest for POS is usually append-only or replace-all. 
+            // Let's replace ALL payments to ensure sync with frontend state.
+            await conn.execute('DELETE FROM payments WHERE order_id = ?', [id]);
+
+            for (const p of updates.payments) {
+                await conn.execute(
+                    'INSERT INTO payments (order_id, method, amount, received_by) VALUES (?, ?, ?, ?)',
+                    [id, p.method, p.amount, p.receivedBy || null]
+                );
+            }
+        }
+
+        await conn.commit();
+
+        // Emit socket immediately to unblock UI
+        const updatedOrder = { ...updates, id };
+        req.io.emit('order_updated', updatedOrder);
+
+        // --- PUSH NOTIFICATIONS (Background) ---
+        (async () => {
+            console.log(`[PUSH-DEBUG] Iniciando hilo de fondo para orden: ${id}`);
+            console.log(`[PUSH-DEBUG] updates.type actual: ${updates.type}`);
+            console.log(`[PUSH-DEBUG] updates.kitchenStatus actual: ${updates.kitchenStatus}`);
+
+            // 1. Check for NEW delivery notification (When type is assigned or updated to delivery)
+            try {
+                const [dbOrder] = await query('SELECT branch_id, type, daily_order_number, delivery_driver_id FROM orders WHERE id = ?', [id]);
+                const lowerOrderType = (dbOrder?.type || '').toLowerCase();
+                console.log(`[PUSH-PUT-DEBUG] dbOrder.type: ${dbOrder?.type} (Normalizado: ${lowerOrderType})`);
+
+                if (dbOrder && lowerOrderType === 'delivery' && !dbOrder.delivery_driver_id) {
+                    console.log(`[PUSH-NEW] Detectada orden de repartidor sin asignar: ${id}. Enviando alerta inicial...`);
+                    const bId = dbOrder.branch_id;
+                    const orderNum = String(dbOrder.daily_order_number || '???').padStart(3, '0');
+
+                    const drivers = await query(
+                        "SELECT id, name, fcm_tokens, roles FROM users WHERE branch_id = ? AND is_active = 1 AND (JSON_CONTAINS(roles, '\"Repartidor\"') OR JSON_CONTAINS(roles, '\"repartidor\"')) AND fcm_tokens IS NOT NULL",
+                        [bId]
+                    );
+
+                    let tokens = [];
+                    drivers.forEach(d => {
+                        let t = d.fcm_tokens;
+                        if (typeof t === 'string' && t !== '') {
+                            try { t = JSON.parse(t); } catch (e) { t = [t]; }
+                        }
+                        if (Array.isArray(t)) {
+                            tokens = tokens.concat(t.filter(tk => typeof tk === 'string' && tk.length > 20));
+                        }
+                    });
+
+                    if (tokens.length > 0) {
+                        await sendPushNotification(tokens, `🔥 ¡NUEVO ENVÍO!`, `Orden #${orderNum} lista para ser tomada. 🛵💨`, {
+                            orderId: id,
+                            type: 'delivery_new',
+                            url: '/delivery',
+                            click_action: '/delivery'
+                        }, [
+                            { action: 'open_app', title: '🚀 VER PEDIDO' }
+                        ]);
+                        console.log(`[PUSH-NEW] Alerta enviada a ${tokens.length} tokens.`);
+                    }
+                }
+            } catch (err) {
+                console.error('[PUSH ERROR] NEW delivery notification failed in PUT:', err);
+            }
+
+            // 2. Check for READY notification (Status changed to ready)
+            if (updates.kitchenStatus === 'ready') {
+                try {
+                    console.log(`[PUSH-READY] Analizando orden ${id} para notificación de listo...`);
+                    const [orderInfo] = await query(
+                        'SELECT type, branch_id, waiter_id, daily_order_number, table_id FROM orders WHERE id = ?',
+                        [id]
+                    );
+
+                    if (!orderInfo) return;
+                    const orderNum = String(orderInfo.daily_order_number || '???').padStart(3, '0');
+                    const lowerInfoType = (orderInfo.type || '').toLowerCase();
+                    console.log(`[PUSH-READY-DEBUG] orderInfo.type: ${orderInfo.type} (Normalizado: ${lowerInfoType})`);
+
+                    if (lowerInfoType === 'delivery') {
+                        // Notify ALL active Drivers in this branch
+                        console.log(`[PUSH-READY] Notificando repartidores de Branch: ${orderInfo.branch_id}`);
+                        const drivers = await query(
+                            "SELECT id, name, fcm_tokens, roles FROM users WHERE branch_id = ? AND is_active = 1 AND (JSON_CONTAINS(roles, '\"Repartidor\"') OR JSON_CONTAINS(roles, '\"repartidor\"')) AND fcm_tokens IS NOT NULL",
+                            [orderInfo.branch_id]
+                        );
+
+                        let tokens = [];
+                        drivers.forEach(d => {
+                            let t = d.fcm_tokens;
+                            if (typeof t === 'string' && t !== '') {
+                                try { t = JSON.parse(t); } catch (e) { t = [t]; }
+                            }
+                            if (Array.isArray(t)) {
+                                tokens = tokens.concat(t.filter(tk => typeof tk === 'string' && tk.length > 20));
+                            }
+                        });
+
+                        if (tokens.length > 0) {
+                            await sendPushNotification(tokens, `🛵 ¡REPARTO LISTO!`, `Orden #${orderNum} lista para entregar.`, {
+                                orderId: id,
+                                type: 'delivery_ready',
+                                url: '/delivery'
+                            });
+                        }
+                    } else if (orderInfo.waiter_id) {
+                        // Notify the Waiter (Local/Pickup)
+                        // UPDATE: Desactivado por solicitud del usuario. Los meseros usan Toast Alerts en la app activa.
+                        // Solo Deliveries usan Push Notifications.
+                        /*
+                        const [waiter] = await query('SELECT fcm_tokens FROM users WHERE id = ?', [orderInfo.waiter_id]);
+                        if (waiter && waiter.fcm_tokens) {
+                            let tokens = typeof waiter.fcm_tokens === 'string' ? JSON.parse(waiter.fcm_tokens) : waiter.fcm_tokens;
+                            if (Array.isArray(tokens) && tokens.length > 0) {
+                                await sendPushNotification(tokens, `🍳 ¡PEDIDO LISTO!`, `Orden #${orderNum} de Mesa ${orderInfo.table_id || 'N/A'} está lista.`, {
+                                    orderId: id,
+                                    type: 'order_ready'
+                                });
+                            }
+                        }
+                        */
+                    }
+                } catch (pushErr) {
+                    console.error('[PUSH ERROR] PUT ready notification failed:', pushErr);
+                }
+            } else {
+                console.log(`[PUSH-DEBUG] No se envía notificación porque status no es 'ready' (es: ${updates.kitchenStatus})`);
+            }
+            console.log(`[PUSH-DEBUG] Hilo de fondo finalizado para: ${id}`);
+        })();
+
+        res.json({ success: true });
+    } catch (err) {
+        if (conn) await conn.rollback();
+        console.error(`[PUT /orders/${id}] Error:`, err);
+        res.status(500).json({ error: err.message });
+    } finally {
+        if (conn) conn.release();
+    }
+});
+
+router.delete('/orders/:id', async (req, res) => {
+    const { id } = req.params;
+    const { userId, reason } = req.body; // Expect userId to identify who deleted it, even in DELETE body
+
+    const conn = await pool.getConnection();
+    try {
+        await conn.beginTransaction();
+
+        // 1. Fetch Order Data for Audit
+        const [orders] = await conn.execute('SELECT * FROM orders WHERE id = ?', [id]);
+        if (orders.length === 0) {
+            conn.release();
+            return res.status(404).json({ error: 'Order not found' });
+        }
+        const order = orders[0];
+
+        const [items] = await conn.execute('SELECT * FROM order_items WHERE order_id = ?', [id]);
+        const [payments] = await conn.execute('SELECT * FROM payments WHERE order_id = ?', [id]);
+
+        // Fetch Customer Data if exists
+        let customer = null;
+        if (order.customer_id) {
+            const [customers] = await conn.execute('SELECT * FROM customers WHERE id = ?', [order.customer_id]);
+            if (customers.length > 0) {
+                customer = customers[0];
+            }
+        }
+
+        const fullOrderData = {
+            ...order,
+            items,
+            payments,
+            customer // Attach full customer object
+        };
+
+        // 2. Insert into Audit Log
+        await conn.execute(
+            'INSERT INTO order_audit_logs (order_id, branch_id, order_data, deleted_by_user_id, reason) VALUES (?, ?, ?, ?, ?)',
+            [id, order.branch_id, JSON.stringify(fullOrderData), userId || null, reason || null]
+        );
+
+        // 3. Delete (Existing logic)
+        await conn.execute('DELETE FROM order_items WHERE order_id = ?', [id]);
+        await conn.execute('DELETE FROM payments WHERE order_id = ?', [id]);
+        await conn.execute('DELETE FROM orders WHERE id = ?', [id]);
+
+        await conn.commit();
+
+        req.io.emit('order_deleted', { id });
+        res.json({ message: 'Deleted and Audited' });
+    } catch (err) {
+        await conn.rollback();
+        res.status(500).json({ error: err.message });
+    } finally {
+        conn.release();
+    }
+});
+
+
+router.get('/audit-logs', async (req, res) => {
+    try {
+        const { startDate, endDate } = req.query;
+        let sql = `
+            SELECT 
+                al.*, 
+                u.name as deleted_by_name,
+                b.name as branch_name
+            FROM order_audit_logs al
+            LEFT JOIN users u ON al.deleted_by_user_id = u.id
+            LEFT JOIN branches b ON al.branch_id = b.id
+            WHERE 1=1
+        `;
+        const params = [];
+
+        if (startDate && endDate) {
+            sql += ' AND al.deleted_at BETWEEN ? AND ?';
+            params.push(startDate, endDate); // Expects 'YYYY-MM-DD HH:mm:ss'
+        }
+
+        sql += ' ORDER BY al.deleted_at DESC LIMIT 100';
+
+        const logs = await query(sql, params);
+
+        // Parse JSON order_data
+        const parsedLogs = logs.map(log => ({
+            ...log,
+            order_data: typeof log.order_data === 'string' ? JSON.parse(log.order_data) : log.order_data
+        }));
+
+        res.json(parsedLogs);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// --- BRANCHES ---
+router.post('/branches', async (req, res) => {
+    const { name, address, phone, gasWebhookUrl, isActive, ticketWidth, logoUrl } = req.body;
+    try {
+        const result = await query(
+            'INSERT INTO branches (name, address, phone, gas_webhook_url, is_active, ticket_width, logo_url) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            [name, address, phone, gasWebhookUrl, isActive ? 1 : 0, ticketWidth || '80mm', logoUrl || null]
+        );
+        res.json({ id: result.insertId, name, address, phone, gasWebhookUrl, isActive, ticketWidth, logoUrl });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.put('/branches/:id', async (req, res) => {
+    const { id } = req.params;
+    const { name, address, phone, gasWebhookUrl, geminiApiKey, isActive, autoCloseTime, autoCloseEnabled, ticketWidth, logoUrl } = req.body;
+    try {
+        // Fix: Convert undefined to null for mysql2
+        const safe = (val) => val === undefined ? null : val;
+
+        // Note: We are keeping gemini_api_key and gas_webhook_url here for now to avoid breaking legacy, 
+        // but frontend now saves them to app_config. We should probably NOT overwrite them if they are undefined 
+        // (which means frontend didn't send them). 
+        // However, the current query OVERWRITES them. 
+        // Let's make the query dynamic to only update provided fields? 
+        // Or simpler: just ensure we don't crash with undefined. 
+        // AND add logo_url which was missing!
+
+        // Dynamic Update approach is safer here to support partial updates
+        let fields = [];
+        let params = [];
+
+        if (name !== undefined) { fields.push('name = ?'); params.push(name); }
+        if (address !== undefined) { fields.push('address = ?'); params.push(address); }
+        if (phone !== undefined) { fields.push('phone = ?'); params.push(phone); }
+        if (logoUrl !== undefined) { fields.push('logo_url = ?'); params.push(logoUrl); }
+
+        // Only update these if provided (legacy support)
+        if (gasWebhookUrl !== undefined) { fields.push('gas_webhook_url = ?'); params.push(gasWebhookUrl); }
+        if (geminiApiKey !== undefined) { fields.push('gemini_api_key = ?'); params.push(geminiApiKey); }
+
+        if (isActive !== undefined) { fields.push('is_active = ?'); params.push(isActive ? 1 : 0); }
+        if (autoCloseTime !== undefined) { fields.push('auto_close_time = ?'); params.push(autoCloseTime || null); }
+        if (autoCloseEnabled !== undefined) { fields.push('auto_close_enabled = ?'); params.push(autoCloseEnabled ? 1 : 0); }
+        if (ticketWidth !== undefined) { fields.push('ticket_width = ?'); params.push(ticketWidth || '80mm'); }
+
+        if (fields.length === 0) return res.json({ message: 'No changes' });
+
+        params.push(id);
+
+        await query(`UPDATE branches SET ${fields.join(', ')} WHERE id = ?`, params);
+
+        res.json({ message: 'Updated' });
+    } catch (err) {
+        console.error('Update Branch Error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.delete('/branches/:id', async (req, res) => {
+    const { id } = req.params;
+    try {
+        await query('DELETE FROM branches WHERE id = ?', [id]);
+        res.json({ message: 'Deleted' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// --- USERS ---
+router.post('/users', async (req, res) => {
+    const { name, username, pin, roles, branchId, isActive } = req.body;
+    try {
+        const result = await query(
+            'INSERT INTO users (name, username, pin, roles, branch_id, is_active) VALUES (?, ?, ?, ?, ?, ?)',
+            [name, username, pin, JSON.stringify(roles), branchId, isActive ? 1 : 0]
+        );
+        res.json({ id: result.insertId, ...req.body });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.put('/users/:id', async (req, res) => {
+    const { id } = req.params;
+    const { name, username, pin, roles, branchId, isActive } = req.body;
+
+    console.log(`[PUT /users/${id}] Payload:`, req.body);
+
+    try {
+        // 1. Fetch current user to merge values (Robust Partial Update)
+        const [current] = await query('SELECT * FROM users WHERE id = ?', [id]);
+        if (!current) return res.status(404).json({ error: 'User not found' });
+
+        const finalName = name || current.name;
+        const finalUsername = username || current.username;
+        const finalPin = pin || current.pin;
+        const finalRoles = roles ? JSON.stringify(roles) : current.roles;
+        const finalBranchId = branchId !== undefined ? branchId : current.branch_id;
+
+        // Handle boolean carefully (false IS a value)
+        const finalIsActive = isActive !== undefined ? (isActive ? 1 : 0) : (current.is_active !== undefined ? current.is_active : 1);
+
+        await query(
+            'UPDATE users SET name = ?, username = ?, pin = ?, roles = ?, branch_id = ?, is_active = ? WHERE id = ?',
+            [finalName, finalUsername, finalPin, finalRoles, finalBranchId, finalIsActive, id]
+        );
+        res.json({ message: 'Updated', id });
+    } catch (err) {
+        console.error('Update User Error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.delete('/users/:id', async (req, res) => {
+    const { id } = req.params;
+    try {
+        await query('DELETE FROM users WHERE id = ?', [id]);
+        res.json({ message: 'Deleted' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// --- CATEGORIES ---
+router.post('/categories', async (req, res) => {
+    const { name } = req.body;
+    try {
+        const result = await query('INSERT INTO categories (name) VALUES (?)', [name]);
+        res.json({ id: result.insertId, name });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.put('/categories/:id', async (req, res) => {
+    const { id } = req.params;
+    const { name } = req.body;
+    try {
+        await query('UPDATE categories SET name = ? WHERE id = ?', [name, id]);
+        res.json({ message: 'Updated' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.delete('/categories/:id', async (req, res) => {
+    const { id } = req.params;
+    try {
+        await query('DELETE FROM categories WHERE id = ?', [id]);
+        res.json({ message: 'Deleted' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// --- MEATS ---
+router.post('/meats', async (req, res) => {
+    const { name } = req.body;
+    try {
+        const result = await query('INSERT INTO meats (name) VALUES (?)', [name]);
+        res.json({ id: result.insertId, name });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+
+
+// --- PRODUCT EXTRAS ---
+router.post('/product_extras', async (req, res) => {
+    const { name, price } = req.body;
+    try {
+        const result = await query('INSERT INTO product_extras (name, price) VALUES (?, ?)', [name, price]);
+        res.json({ id: result.insertId, name, price });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.put('/product_extras/:id', async (req, res) => {
+    const { id } = req.params;
+    const { name, price } = req.body;
+    try {
+        await query('UPDATE product_extras SET name = ?, price = ? WHERE id = ?', [name, price, id]);
+        res.json({ message: 'Updated' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.delete('/product_extras/:id', async (req, res) => {
+    const { id } = req.params;
+    try {
+        await query('DELETE FROM product_extras WHERE id = ?', [id]);
+        res.json({ message: 'Deleted' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+// AUTO-MIGRATION: Add settings columns to branches
+(async () => {
+    const conn = await pool.getConnection();
+    try {
+        const columns = [
+            { name: 'logo_url', type: 'VARCHAR(500) DEFAULT NULL' },
+            { name: 'ticket_width', type: 'VARCHAR(20) DEFAULT "80mm"' },
+            { name: 'auto_close_time', type: 'TIME DEFAULT NULL' },
+            { name: 'auto_close_enabled', type: 'TINYINT(1) DEFAULT 0' },
+            { name: 'gemini_api_key', type: 'VARCHAR(500) DEFAULT NULL' }
+        ];
+
+        const [existing] = await conn.query('SHOW COLUMNS FROM branches');
+        const names = existing.map(c => c.Field);
+
+        for (const col of columns) {
+            if (!names.includes(col.name)) {
+                console.log(`Migrating: Adding ${col.name} to branches...`);
+                try {
+                    await conn.query(`ALTER TABLE branches ADD COLUMN ${col.name} ${col.type}`);
+                    console.log(`Added ${col.name} to branches.`);
+                } catch (err) {
+                    console.error(`Failed to add ${col.name}:`, err);
+                }
+            }
+        }
+    } catch (e) {
+        console.error('Branches auto-migration failed:', e);
+    } finally {
+        conn.release();
+    }
+})();
+
+// AUTO-MIGRATION: Add global_store_name to app_config
+(async () => {
+    const conn = await pool.getConnection();
+    try {
+        const [rows] = await conn.query("SELECT 1 FROM app_config WHERE setting_key = 'global_store_name'");
+        if (rows.length === 0) {
+            console.log('Migrating: Adding global_store_name to app_config...');
+            await conn.query("INSERT INTO app_config (setting_key, setting_value) VALUES (?, ?)", ['global_store_name', 'RESTAURANTE']);
+        }
+
+        // Add global_logo_url
+        const [logoRows] = await conn.query("SELECT 1 FROM app_config WHERE setting_key = 'global_logo_url'");
+        if (logoRows.length === 0) {
+            console.log('Migrating: Adding global_logo_url to app_config...');
+            await conn.query("INSERT INTO app_config (setting_key, setting_value) VALUES (?, ?)", ['global_logo_url', '']);
+        }
+    } catch (e) {
+        // Table might not exist yet if this runs before the app_config creator, which is fine
+    } finally {
+        conn.release();
+    }
+})();
+
+// --- AI PARSER ENDPOINT ---
+router.post('/ai/parse-order', async (req, res) => {
+    const { text } = req.body; // Removed branchId requirement for Config
+    if (!text) return res.status(400).json({ error: 'Text is required' });
+
+    const conn = await pool.getConnection();
+    try {
+        // 1. Fetch Config & Context
+        const [config] = await conn.execute("SELECT setting_value FROM app_config WHERE setting_key = 'gemini_api_key'");
+        const apiKey = config[0]?.setting_value;
+
+        if (!apiKey) return res.status(400).json({ error: 'Gemini API Key not configured globally (Master Settings)' });
+
+        const [products] = await conn.execute('SELECT id, name, category_id, requires_meat, requires_masa FROM products WHERE is_active = 1');
+        const [meats] = await conn.execute('SELECT id, name, type FROM meats WHERE is_active = 1');
+        const [extras] = await conn.execute('SELECT id, name, price FROM product_extras WHERE is_active = 1');
+
+        // 2. Construct Prompt
+        const menuContext = JSON.stringify({
+            products: products.map(p => ({ id: p.id, name: p.name, requires_meat: !!p.requires_meat, requires_masa: !!p.requires_masa })),
+            meats: meats.filter(m => !m.type || m.type === 'meat').map(m => ({ id: m.id, name: m.name })),
+            masas: meats.filter(m => m.type === 'masa').map(m => ({ id: m.id, name: m.name })),
+            extras: extras.map(e => ({ id: e.id, name: e.name }))
+        });
+
+        const prompt = `
+            You are an order parser. 
+            CONTEXT: Here is the restaurant menu JSON: ${menuContext}
+            USER TEXT: "${text}"
+            
+            TASK: 
+            1. Extract the customer name and address if present.
+            2. Extract the customer PHONE number if present (format as digits).
+            3. Extract the customer EMAIL address if present.
+            4. Extract items. For each item:
+               - Find the BEST MATCH "productId" from the menu.
+               - IMPORTANT: If the user specifies a meat (e.g. "Tacos de Pastor"), map "Tacos" to productId and "Pastor" to meatId.
+               - IMPORTANT: If the user specifies a masa/dough type (e.g. "Pupusa de Arroz"), map "Arroz" to masaId.
+               - Map extras to "extras" array (ids).
+               - Capture quantity.
+            
+            OUTPUT JSON ONLY (No markdown):
+            {
+               "customerName": "...",
+               "customerPhone": "...",
+               "customerEmail": "...",
+               "address": "...",
+               "items": [
+                  { "productId": 123, "quantity": 1, "meatId": 456, "masaId": 789, "extraIds": [12], "note": "sin cebolla" }
+               ]
+            }
+        `;
+
+        // 3. Call Gemini API
+        // Using "gemini-flash-latest" (Stable Flash) for better free tier limits
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                contents: [{ parts: [{ text: prompt }] }]
+            })
+        });
+
+        const data = await response.json();
+
+        if (data.error) throw new Error(data.error.message || 'Gemini API Error');
+
+        const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!rawText) throw new Error('No response from AI');
+
+        // Cleanup JSON (remove markdown code blocks if present)
+        // Cleanup JSON (remove markdown code blocks if present)
+        let jsonStr = rawText.replace(/```json/g, '').replace(/```/g, '').trim();
+
+        // Robust extraction: Find the outer-most JSON object to ignore pre/post text
+        const firstOpen = jsonStr.indexOf('{');
+        const lastClose = jsonStr.lastIndexOf('}');
+
+        if (firstOpen !== -1 && lastClose !== -1 && lastClose > firstOpen) {
+            jsonStr = jsonStr.substring(firstOpen, lastClose + 1);
+        }
+
+        const result = JSON.parse(jsonStr);
+
+        res.json(result);
+
+    } catch (err) {
+        console.error('AI Parse Error:', err);
+        res.status(500).json({ error: err.message });
+    } finally {
+        if (conn) conn.release();
+    }
+});
+
+// --- CUSTOMERS ---
+
+// Endpoint for Passive GPS Address Capture
+router.post('/customers/:id/gps_address', async (req, res) => {
+    const { id } = req.params;
+    const { latitude, longitude, addressId } = req.body;
+
+    if (!latitude || !longitude) return res.status(400).json({ error: 'Lat/Lng required' });
+
+    const conn = await pool.getConnection();
+    try {
+        // 1. If addressId is provided, try to update that specific address first
+        if (addressId) {
+            const [updateResult] = await conn.execute(
+                'UPDATE customer_addresses SET latitude = ?, longitude = ? WHERE id = ? AND customer_id = ?',
+                [latitude, longitude, addressId, id]
+            );
+
+            if (updateResult.affectedRows > 0) {
+                req.io.emit('customers_updated');
+                return res.json({ message: 'Address GPS updated', status: 'updated', id: addressId });
+            }
+        }
+
+        // 2. Fallback: Fetch existing addresses to avoid duplicates near the same spot
+        const [addresses] = await conn.execute(
+            'SELECT * FROM customer_addresses WHERE customer_id = ?',
+            [id]
+        );
+
+        // 2. Haversine Distance Helper
+        const toRad = (val) => val * Math.PI / 180;
+        const calcDistance = (lat1, lon1, lat2, lon2) => {
+            const R = 6371e3; // metres
+            const φ1 = toRad(lat1);
+            const φ2 = toRad(lat2);
+            const Δφ = toRad(lat2 - lat1);
+            const Δλ = toRad(lon2 - lon1);
+
+            const a = Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
+                Math.cos(φ1) * Math.cos(φ2) *
+                Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+            return R * c;
+        };
+
+        let isDuplicate = false;
+        for (const addr of addresses) {
+            if (addr.latitude && addr.longitude) {
+                const dist = calcDistance(latitude, longitude, addr.latitude, addr.longitude);
+                if (dist < 30) { // 30 meters
+                    isDuplicate = true;
+                    break;
+                }
+            }
+        }
+
+        if (isDuplicate) {
+            return res.json({ message: 'Location already exists (within 30m)', status: 'duplicate' });
+        }
+
+        // 3. Create New Address with numbering
+        const dateStr = new Date().toLocaleDateString('es-ES');
+
+        // Count how many GPS addresses already exist for this customer TODAY to get the next number
+        const [existingGPS] = await conn.execute(
+            'SELECT COUNT(*) as count FROM customer_addresses WHERE customer_id = ? AND street LIKE ?',
+            [id, `📍 Ubicación GPS (${dateStr})%`]
+        );
+        const nextNum = (existingGPS[0].count || 0) + 1;
+
+        const addrId = `gps-${Date.now()}`;
+        const streetName = `📍 Ubicación GPS (${dateStr}) # ${nextNum}`;
+
+        await conn.execute(
+            'INSERT INTO customer_addresses (id, customer_id, street, city, details, latitude, longitude) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            [addrId, id, streetName, 'San Salvador', 'Capturada en Entrega', latitude, longitude]
+        );
+
+        req.io.emit('customers_updated');
+        res.json({ message: 'GPS Address Saved', id: addrId, street: streetName, status: 'created' });
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    } finally {
+        conn.release();
+    }
+});
+
+// --- CUSTOMERS ---
+router.get('/customers', async (req, res) => {
+    const { search } = req.query;
+    try {
+        let sql = 'SELECT * FROM customers';
+        const params = [];
+
+        if (search) {
+            sql += ' WHERE name LIKE ? OR phone LIKE ?';
+            params.push(`%${search}%`, `%${search}%`);
+        } else {
+            // Limit unrelated results if no search to avoid huge dumps (though initial-data does it)
+            // But usually this endpoint is for search.
+            sql += ' LIMIT 100';
+        }
+
+        const customers = await query(sql, params);
+
+        // Populate addresses
+        if (customers.length > 0) {
+            const customerIds = customers.map(c => c.id);
+            // Placeholders for IN clause
+            const placeholders = customerIds.map(() => '?').join(',');
+            const addresses = await query(`SELECT * FROM customer_addresses WHERE customer_id IN (${placeholders})`, customerIds);
+
+            customers.forEach(c => {
+                c.addresses = addresses.filter(a => a.customer_id === c.id);
+                // Map camelCase for frontend consistency if needed, but StartScreen expects snake_case from initial-data?
+                // Wait, initial-data maps fields? No, it passes row data. 
+                // But Types define camelCase?
+                // Step 675: `customers.forEach(c => c.addresses = ...)` in initial-data.
+                // It does NOT map snake to camel for birth_date in initial-data LOGIC, but it maps it in `if (c.birth_date)`.
+                // My API should behave like initial-data output.
+                // Addresses table has `street`, `city`... 
+                // Address type in frontend expects `customerId`? YES.
+                // Address table has `customer_id`.
+                c.addresses.forEach(a => a.customerId = a.customer_id);
+            });
+        }
+
+        res.json(customers);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.post('/customers', async (req, res) => {
+    const { name, phone, email, addresses, birthDate } = req.body;
+    const conn = await pool.getConnection(); // Use transaction for robustness
+    try {
+        await conn.beginTransaction();
+
+
+
+        let customerId;
+        // Strict normalization
+        const nName = name || 'SIN NOMBRE';
+        const nPhone = phone || '';
+        const nEmail = email || null;
+        const nBirth = (typeof birthDate === 'string' && birthDate.trim() !== '') ? birthDate : null;
+
+        try {
+            const [result] = await conn.execute(
+                'INSERT INTO customers (name, phone, email, birth_date) VALUES (?, ?, ?, ?)',
+                safeParams([nName, nPhone, nEmail, nBirth])
+            );
+            customerId = result.insertId;
+        } catch (dbErr) {
+            // If the column really doesn't exist, we fallback
+            if (dbErr.code === 'ER_BAD_FIELD_ERROR') {
+                const [result] = await conn.execute(
+                    'INSERT INTO customers (name, phone, email) VALUES (?, ?, ?)',
+                    safeParams([nName, nPhone, nEmail])
+                );
+                customerId = result.insertId;
+            } else {
+                throw dbErr;
+            }
+        }
+
+        const savedAddresses = [];
+        if (addresses && Array.isArray(addresses)) {
+            for (const addr of addresses) {
+                const addrId = addr.id || `addr-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+                await conn.execute(
+                    'INSERT INTO customer_addresses (id, customer_id, street, city, details, latitude, longitude) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                    safeParams([addrId, customerId, addr.street, addr.city || 'San Salvador', addr.details || '', addr.latitude, addr.longitude])
+                );
+                savedAddresses.push({ ...addr, id: addrId, customerId });
+            }
+        }
+
+        await conn.commit();
+
+        const newCustomer = { id: customerId, name, phone, email, birthDate, addresses: savedAddresses };
+        req.io.emit('customers_updated'); // Broadcast update
+        res.json(newCustomer);
+    } catch (err) {
+        await conn.rollback();
+        res.status(500).json({ error: err.message });
+    } finally {
+        conn.release();
+    }
+});
+
+// Route to update customer and their addresses
+router.put('/customers/:id', async (req, res) => {
+    const { id } = req.params;
+    const { name, phone, email, addresses, birthDate } = req.body;
+
+    const conn = await pool.getConnection();
+    try {
+        await conn.beginTransaction();
+
+
+
+        // Strict normalization
+        const nName = name || 'SIN NOMBRE';
+        const nPhone = phone || '';
+        const nEmail = email || null;
+        const nBirth = (typeof birthDate === 'string' && birthDate.trim() !== '') ? birthDate : null;
+
+        try {
+            await conn.execute(
+                'UPDATE customers SET name = ?, phone = ?, email = ?, birth_date = ? WHERE id = ?',
+                safeParams([nName, nPhone, nEmail, nBirth, id])
+            );
+        } catch (dbErr) {
+            if (dbErr.code === 'ER_BAD_FIELD_ERROR') {
+                await conn.execute(
+                    'UPDATE customers SET name = ?, phone = ?, email = ? WHERE id = ?',
+                    safeParams([nName, nPhone, nEmail, id])
+                );
+            } else {
+                throw dbErr;
+            }
+        }
+
+        // 2. Update Addresses (Replace All Strategy)
+        if (addresses && Array.isArray(addresses)) {
+            await conn.execute('DELETE FROM customer_addresses WHERE customer_id = ?', [id]);
+
+            for (const addr of addresses) {
+                // Ensure ID exists
+                const addrId = addr.id || `addr-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+                await conn.execute(
+                    'INSERT INTO customer_addresses (id, customer_id, street, city, details, latitude, longitude) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                    safeParams([addrId, id, addr.street, addr.city || 'San Salvador', addr.details || '', addr.latitude, addr.longitude])
+                );
+            }
+        }
+
+        await conn.commit();
+        req.io.emit('customers_updated');
+        res.json({ id, name, phone, email, birthDate, addresses });
+    } catch (err) {
+        await conn.rollback();
+        res.status(500).json({ error: err.message });
+    } finally {
+        conn.release();
+    }
+});
+
+router.delete('/customers/:id', async (req, res) => {
+    const { id } = req.params;
+    const conn = await pool.getConnection();
+    try {
+        await conn.beginTransaction();
+        await conn.execute('DELETE FROM customer_addresses WHERE customer_id = ?', [id]);
+        await conn.execute('DELETE FROM customers WHERE id = ?', [id]);
+        await conn.commit();
+
+        req.io.emit('customers_updated');
+        res.json({ message: 'Deleted' });
+    } catch (err) {
+        await conn.rollback();
+        res.status(500).json({ error: err.message });
+    } finally {
+        conn.release();
+    }
+});
+
+// --- PRODUCTS ---
+router.post('/products', async (req, res) => {
+    const { name, price, categoryId, requiresMeat, requiresMasa, availableExtraIds, isActive } = req.body;
+    try {
+        const result = await query(
+            'INSERT INTO products (name, price, category_id, requires_meat, requires_masa, available_extras, is_active) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            [name, price, categoryId, requiresMeat ? 1 : 0, requiresMasa ? 1 : 0, JSON.stringify(availableExtraIds || []), isActive ? 1 : 0]
+        );
+        req.io.emit('catalog_updated');
+        res.json({ id: result.insertId, ...req.body });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.put('/products/:id', async (req, res) => {
+    const { id } = req.params;
+    const { name, price, categoryId, requiresMeat, requiresMasa, availableExtraIds, isActive } = req.body;
+    try {
+        await query(
+            'UPDATE products SET name = ?, price = ?, category_id = ?, requires_meat = ?, requires_masa = ?, available_extras = ?, is_active = ? WHERE id = ?',
+            [name, price, categoryId, requiresMeat ? 1 : 0, requiresMasa ? 1 : 0, JSON.stringify(availableExtraIds || []), isActive ? 1 : 0, id]
+        );
+        req.io.emit('catalog_updated');
+        res.json({ message: 'Updated' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.delete('/products/:id', async (req, res) => {
+    const { id } = req.params;
+    try {
+        await query('DELETE FROM products WHERE id = ?', [id]);
+        res.json({ message: 'Deleted' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// --- TABLES ---
+router.post('/tables', async (req, res) => {
+    const { name, branchId } = req.body;
+    try {
+        const result = await query('INSERT INTO tables (name, branch_id) VALUES (?, ?)', [name, branchId]);
+        res.json({ id: result.insertId, name, branchId });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.delete('/tables/:id', async (req, res) => {
+    const { id } = req.params;
+    try {
+        await query('DELETE FROM tables WHERE id = ?', [id]);
+        res.json({ message: 'Deleted' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// DEBUG ENDPOINT (Remove later)
+router.get('/debug-autoclose', async (req, res) => {
+    try {
+        const now = new Date();
+        const pad = (n) => n.toString().padStart(2, '0');
+        const currentTime = `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+        const today = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+
+        const branches = await query('SELECT * FROM branches');
+
+        res.json({
+            serverTimeRaw: now.toString(),
+            serverTimeISO: now.toISOString(),
+            calculatedCurrentTime: currentTime,
+            calculatedToday: today,
+            branches: branches.map(b => ({
+                name: b.name,
+                autoCloseEnabled: b.auto_close_enabled,
+                autoCloseTime: b.auto_close_time,
+                lastRun: b.last_auto_close_run,
+                willRun: (b.auto_close_enabled && b.auto_close_time && currentTime >= b.auto_close_time) ? 'YES' : 'NO'
+            }))
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// --- SALES PROJECTIONS ---
+router.post('/sales/goals', async (req, res) => {
+    const { branchId, monthYear, targetAmount, totalWorkDays, manualSales, manualDays } = req.body;
+    try {
+        await query(`
+            INSERT INTO sales_goals (branch_id, month_year, target_amount, total_work_days, manual_sales, manual_days)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON DUPLICATE KEY UPDATE 
+                target_amount = VALUES(target_amount),
+                total_work_days = VALUES(total_work_days),
+                manual_sales = VALUES(manual_sales),
+                manual_days = VALUES(manual_days)
+        `, [branchId || 1, monthYear, targetAmount, totalWorkDays || 30, manualSales || null, manualDays || null]);
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// GET list of goals for history/list view
+router.get('/sales/goals', async (req, res) => {
+    const { branchId } = req.query;
+    try {
+        const goals = await query(`
+            SELECT 
+                sg.id, 
+                sg.month_year, 
+                sg.target_amount, 
+                sg.total_work_days,
+                sg.manual_sales,
+                sg.manual_days,
+                COALESCE(sg.manual_sales, SUM(o.total), 0) as current_sales,
+                COALESCE(sg.manual_days, COUNT(DISTINCT DATE(o.created_at)), 0) as days_with_sales
+            FROM sales_goals sg
+            LEFT JOIN orders o ON 
+                o.status = 'completed' AND 
+                o.branch_id = sg.branch_id AND 
+                DATE_FORMAT(o.created_at, '%Y-%m') = sg.month_year
+            WHERE sg.branch_id = ? 
+            GROUP BY sg.id, sg.month_year, sg.target_amount, sg.total_work_days, sg.manual_sales, sg.manual_days
+            ORDER BY sg.month_year DESC
+        `, [branchId || 1]);
+        res.json(goals);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.get('/sales/projection', async (req, res) => {
+    const { branchId, monthYear } = req.query; // monthYear optional, default current (local server time)
+    const targetBranch = branchId || 1;
+
+    try {
+        // Determine dates based on monthYear string or current date
+        const now = new Date();
+        // If monthYear is provided, parse it 'YYYY-MM', else use current year/month
+        let year, month;
+
+        if (monthYear) {
+            const parts = monthYear.split('-');
+            year = parseInt(parts[0]);
+            month = parseInt(parts[1]) - 1; // 0-indexed
+        } else {
+            year = now.getFullYear();
+            month = now.getMonth();
+        }
+
+        const pad = (n) => n.toString().padStart(2, '0');
+        const currentMonthStr = `${year}-${pad(month + 1)}`;
+
+        // Start of month: 1st day 00:00:00
+        const startOfMonthDate = new Date(year, month, 1);
+        const startOfMonth = `${year}-${pad(month + 1)}-01 00:00:00`;
+
+        // Start of NEXT month (for query upper bound <)
+        const nextMonthDate = new Date(year, month + 1, 1);
+        const endOfMonthQuery = `${nextMonthDate.getFullYear()}-${pad(nextMonthDate.getMonth() + 1)}-01 00:00:00`;
+
+        // 1. Get Goal, Work Days & Manual Data
+        const goals = await query('SELECT target_amount, total_work_days, manual_sales, manual_days FROM sales_goals WHERE branch_id = ? AND month_year = ?', [targetBranch, currentMonthStr]);
+        const targetAmount = goals.length > 0 ? parseFloat(goals[0].target_amount) : 0;
+        const totalWorkDays = goals.length > 0 ? (goals[0].total_work_days || 30) : 30;
+        const manualSales = goals.length > 0 ? goals[0].manual_sales : null;
+        const manualDays = goals.length > 0 ? goals[0].manual_days : null;
+
+        // 2. Get Total Sales
+        const sales = await query(`
+            SELECT 
+                SUM(total) as total_sales
+            FROM orders 
+            WHERE branch_id = ? 
+            AND status = 'completed'
+            AND created_at >= ? 
+            AND created_at < ?
+        `, [targetBranch, startOfMonth, endOfMonthQuery]);
+
+        const currentSales = (manualSales !== null) ? parseFloat(manualSales) : (sales[0].total_sales ? parseFloat(sales[0].total_sales) : 0);
+
+        // 3. Calculate Projection (Linear based on ELAPSED DAYS vs WORK DAYS if configured)
+        // Ideally: We need "Elapsed Work Days". For now, we use "Elapsed Calendar Days" but scaled to the "Total Work Days" ratio if needed.
+        // SIMPLIFICATION: User enters "Total Work Days" (e.g., 26). 
+        // We assume sales happen on work days. 
+        // Projection = (CurrentSales / ElapsedCalendarDays) * TotalCalendarDays -- WRONG if we want to use Work Days.
+
+        // Better Logic:
+        // Projection = (CurrentSales / ElapsedDays) * DaysInMonth (Standard Calendar Projection)
+        // OR
+        // Projection = (CurrentSales / ElapsedDays) * TotalWorkDays (If we assume only work days matter? No, that's complex without knowing holidays).
+
+        // Let's stick to CALENDAR DAYS for the projection math to keep it robust (since we don't track holidays), 
+        // BUT we return 'totalWorkDays' so the Frontend can display "Daily Goal = Target / TotalWorkDays"
+        // This is usually what restaurant owners want: "I need to sell $X per working day".
+
+        const lastDayOfMonth = new Date(year, month + 1, 0).getDate(); // e.g. 30 or 31
+        const viewingCurrentMonth = now.getFullYear() === year && now.getMonth() === month;
+
+        let projection = currentSales; // Default if month ended
+        let elapsedDays = lastDayOfMonth;
+
+        if (viewingCurrentMonth) {
+            elapsedDays = now.getDate(); // e.g. 15th
+            const daysToProject = Math.max(1, elapsedDays);
+            const dailyAverage = currentSales / daysToProject; // Real Daily Speed
+            projection = dailyAverage * lastDayOfMonth; // Simple linear projection (assuming open 7 days/week for simplicity of projection)
+            // If they modify Work Days, it mostly affects the "Required Daily Average" KPI, not necessarily the linear projection unless we filter closed days.
+        }
+
+        // 4. Daily Data for Chart
+        const dailyData = await query(`
+             SELECT 
+                DAY(created_at) as day,
+                SUM(total) as total
+             FROM orders
+             WHERE branch_id = ?
+             AND status = 'completed'
+             AND created_at >= ?
+             AND created_at < ?
+             GROUP BY DAY(created_at)
+             ORDER BY day ASC
+        `, [targetBranch, startOfMonth, endOfMonthQuery]);
+
+        res.json({
+            monthYear: currentMonthStr,
+            targetAmount,
+            totalWorkDays, // Return this!
+            currentSales,
+            projection,
+            daysInMonth: lastDayOfMonth,
+            elapsedDays,
+            dailySales: dailyData
+        });
+
+    } catch (err) {
+        console.error('Projection Error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// --- NOTIFY DELIVERY ---
+router.post('/orders/:id/notify_delivery', async (req, res) => {
+    const { id } = req.params;
+    try {
+        const [rows] = await pool.execute('SELECT * FROM orders WHERE id = ?', [id]);
+        if (rows.length === 0) return res.status(404).json({ error: 'Order not found' });
+
+        const order = rows[0];
+        // Fetch customer/table for notification details
+        const [custRows] = await pool.execute('SELECT * FROM customers WHERE id = ?', [order.customer_id]);
+        const customer = custRows[0] || null;
+
+        const payload = {
+            dailyOrderNumber: order.daily_order_number,
+            customerName: customer ? customer.name : 'Cliente',
+            type: order.type
+        };
+
+        req.io.emit('delivery_notification', payload);
+
+        // --- PUSH NOTIFICATION (Alert Resend) ---
+        console.log(`[Realert-DEBUG] Solicitud de realerta recibida para Order ID: ${id}. Tipo: ${order.type}`);
+
+        const lowerType = (order.type || '').toLowerCase();
+        if (lowerType === 'delivery') {
+            (async () => {
+                try {
+                    const bId = order.branch_id || order.branchId;
+                    console.log(`[Realert-DEBUG] Buscando repartidores para Branch: ${bId}`);
+
+                    const drivers = await query(
+                        "SELECT id, name, fcm_tokens, roles FROM users WHERE branch_id = ? AND is_active = 1 AND (JSON_CONTAINS(roles, '\"Repartidor\"') OR JSON_CONTAINS(roles, '\"repartidor\"')) AND fcm_tokens IS NOT NULL",
+                        [bId]
+                    );
+
+                    console.log(`[Realert-DEBUG] Repartidores encontrados en DB: ${drivers.length}`);
+
+                    let tokens = [];
+                    drivers.forEach(d => {
+                        let t = d.fcm_tokens;
+                        if (typeof t === 'string' && t !== '') {
+                            try { t = JSON.parse(t); } catch (e) { t = [t]; }
+                        }
+                        if (Array.isArray(t)) {
+                            const validTokens = t.filter(tk => typeof tk === 'string' && tk.length > 20);
+                            console.log(`[Realert-DEBUG] User ${d.id} (${d.name}): ${t.length} tokens raw, ${validTokens.length} validos.`);
+                            tokens = tokens.concat(validTokens);
+                        }
+                    });
+
+                    console.log(`[Realert-DEBUG] Total tokens a notificar: ${tokens.length}`);
+
+                    if (tokens.length > 0) {
+                        const orderNum = String(order.daily_order_number || '???').padStart(3, '0');
+                        // TEXTOS ACTUALIZADOS: Más urgencia y emojis llamativos
+                        const title = order.delivery_driver_id
+                            ? `🔔 RECORDATORIO DE ENTREGA`
+                            : `🔥 ¡PEDIDO EN ESPERA!`;
+
+                        const body = order.delivery_driver_id
+                            ? `Orden #${orderNum} asignada a ti. ¡En marcha! 🛵`
+                            : `Orden #${orderNum} necesita repartidor urgente. 🛵💨`;
+
+                        console.log(`[Realert-DEBUG] Enviando notificación... Título: ${title}`);
+
+                        const pushResult = await sendPushNotification(tokens, title, body, {
+                            orderId: id,
+                            type: 'delivery_alert',
+                            url: '/delivery',
+                            click_action: '/delivery' // Soporte legacy
+                        }, [
+                            { action: 'open_app', title: '🚀 VER PEDIDO' }
+                        ]);
+                        console.log(`[Realert-DEBUG] Firebase Result:`, pushResult ? 'Success ✅' : 'Failed ❌');
+                    } else {
+                        console.log('[Realert-DEBUG] ⚠️ No hay tokens válidos para enviar.');
+                    }
+                } catch (pushErr) {
+                    console.error('[Realert-ERROR] Falló el reenvío:', pushErr);
+                }
+            })();
+        } else {
+            console.log(`[Realert-DEBUG] No es delivery. Tipo era: ${order.type}`);
+        }
+
+        res.json({ success: true, message: 'Notification sent' });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+
+// --- GLOBAL SETTINGS ---
+router.get('/settings', async (req, res) => {
+    try {
+        const rows = await query('SELECT setting_key, setting_value FROM app_config');
+        // Convert to object { gemini_api_key: "..." }
+        const settings = rows.reduce((acc, row) => {
+            acc[row.setting_key] = row.setting_value;
+            return acc;
+        }, {});
+        res.json(settings);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.post('/settings', async (req, res) => {
+    const settings = req.body; // { gemini_api_key: "..." }
+    const conn = await pool.getConnection();
+    try {
+        await conn.beginTransaction();
+        const keys = Object.keys(settings);
+        for (const key of keys) {
+            const value = settings[key];
+            // Upsert
+            await conn.query(`
+                INSERT INTO app_config (setting_key, setting_value) 
+                VALUES (?, ?) 
+                ON DUPLICATE KEY UPDATE setting_value = ?
+            `, [key, value, value]);
+        }
+        await conn.commit();
+        res.json({ success: true, message: 'Settings saved' });
+    } catch (err) {
+        await conn.rollback();
+        res.status(500).json({ error: err.message });
+    } finally {
+        conn.release();
+    }
+});
+
+// --- CASH CLOSING REPORTS ---
+router.post('/cash-closing', async (req, res) => {
+    const { branchId, date, initialCash, totalSales, totalCashIn, totalChangeOut, expectedCash, summary } = req.body;
+
+    console.log(`[POST /cash-closing] Saving report for Branch ${branchId} - Date: ${date}`);
+
+    try {
+        await query(`
+            INSERT INTO cash_closing_reports
+            (branch_id, date, initial_cash, total_sales, total_cash_in, total_change_out, expected_cash, summary)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON DUPLICATE KEY UPDATE
+            initial_cash=VALUES(initial_cash), total_sales=VALUES(total_sales),
+            total_cash_in=VALUES(total_cash_in), total_change_out=VALUES(total_change_out),
+            expected_cash=VALUES(expected_cash), summary=VALUES(summary),
+            created_at=NOW()
+        `, [branchId, date, initialCash, totalSales, totalCashIn, totalChangeOut, expectedCash, JSON.stringify(summary)]);
+
+        req.io.emit('data_updated'); // Force refresh
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Save Closing Error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+export default router;
