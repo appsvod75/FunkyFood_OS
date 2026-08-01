@@ -2342,12 +2342,19 @@ router.put('/orders/:id', async (req, res) => {
                         try {
                             const selections = typeof item.combo_selections === 'string' ? JSON.parse(item.combo_selections) : item.combo_selections;
                             if (Array.isArray(selections)) {
-                                selections.forEach(s => {
-                                    productsToProcess.push({
-                                        pid: s.productId,
-                                        qty: parseFloat(s.quantity) * parseFloat(item.quantity)
+                                const candidates = selections.map(s => ({
+                                    pid: s.productId,
+                                    qty: parseFloat(s.quantity) * parseFloat(item.quantity)
+                                }));
+                                const uniquePids = [...new Set(candidates.map(c => Number(c.pid)))];
+                                if (uniquePids.length > 0) {
+                                    const placeholders = uniquePids.map(() => '?').join(',');
+                                    const [compProducts] = await conn.execute(`SELECT id, track_stock FROM products WHERE id IN (${placeholders})`, uniquePids);
+                                    const trackMap = new Map(compProducts.map(p => [p.id, !!p.track_stock]));
+                                    candidates.forEach(c => {
+                                        if (trackMap.get(c.pid)) productsToProcess.push(c);
                                     });
-                                });
+                                }
                             }
                         } catch (e) {
                             console.error(`[INVENTORY - ERROR] Failed to parse combo selections for item ${item.item_id}`, e);
@@ -4537,16 +4544,27 @@ router.get('/inventory/availability', async (req, res) => {
                 try {
                     const selections = typeof r.combo_selections === 'string' ? JSON.parse(r.combo_selections) : r.combo_selections;
                     if (Array.isArray(selections)) {
-                        selections.forEach(s => {
-                            const compId = s.productId;
-                            const compQty = parseFloat(s.quantity) * qty;
-                            if (availabilityMap[compId] !== undefined) {
-                                availabilityMap[compId] -= compQty;
-                            } else {
-                                // If track stock mainly for components but not initialized (e.g. 0 stock), init it
-                                availabilityMap[compId] = (availabilityMap[compId] || 0) - compQty;
-                            }
-                        });
+                        const candidates = selections.map(s => ({
+                            pid: Number(s.productId),
+                            qty: parseFloat(s.quantity) * qty
+                        }));
+                        const uniquePids = [...new Set(candidates.map(c => c.pid))];
+                        if (uniquePids.length > 0) {
+                            const placeholders = uniquePids.map(() => '?').join(',');
+                            const compRows = await query(`SELECT id, track_stock FROM products WHERE id IN (${placeholders})`, uniquePids);
+                            const trackMap = new Map(compRows.map(p => [p.id, !!p.track_stock]));
+                            candidates.forEach(c => {
+                                if (!trackMap.get(c.pid)) return;
+                                const compId = c.pid;
+                                const compQty = c.qty;
+                                if (availabilityMap[compId] !== undefined) {
+                                    availabilityMap[compId] -= compQty;
+                                } else {
+                                    // If track stock mainly for components but not initialized (e.g. 0 stock), init it
+                                    availabilityMap[compId] = (availabilityMap[compId] || 0) - compQty;
+                                }
+                            });
+                        }
                     }
                 } catch (e) { console.error('Error parsing combo reserved:', e); }
             } else {

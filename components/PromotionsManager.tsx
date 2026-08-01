@@ -212,7 +212,7 @@ const PromotionsManager: React.FC<PromotionsManagerProps> = ({ promotions, setPr
                                 <p className="text-gray-500 text-[9px] font-black uppercase tracking-[0.1em] italic mt-2.5 flex gap-2">
                                     <span className="text-cyan-500">{PromoTypeLabels[p.type]}</span>
                                     <span>•</span>
-                                    <span>{p.discount_type === 'PERCENTAGE' ? `${p.discount_value}% OFF` : `$${p.discount_value} OFF`}</span>
+                                    <span>{p.discount_type === 'PERCENTAGE' ? `${p.discount_value}% OFF` : p.discount_type === 'FIXED_PRICE' ? `A $${p.discount_value}` : `$${p.discount_value} OFF`}</span>
                                 </p>
                             </div>
                             <div className="flex gap-2">

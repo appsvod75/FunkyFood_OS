@@ -103,7 +103,9 @@ export const calculatePromotions = (items: OrderItem[], promotions: PromotionRul
                     const targetUnit = pool[k];
                     const val = promo.discount_type === 'PERCENTAGE'
                         ? (targetUnit.price * Number(promo.discount_value) / 100)
-                        : Number(promo.discount_value);
+                        : promo.discount_type === 'FIXED_PRICE'
+                            ? Math.max(0, targetUnit.price - Number(promo.discount_value))
+                            : Number(promo.discount_value);
                     discountAmount += val;
 
                     // Mark as consumed
@@ -131,7 +133,9 @@ export const calculatePromotions = (items: OrderItem[], promotions: PromotionRul
                     const unitPrice = i.total / i.quantity;
                     const val = promo.discount_type === 'PERCENTAGE'
                         ? (unitPrice * Number(promo.discount_value) / 100)
-                        : Number(promo.discount_value);
+                        : promo.discount_type === 'FIXED_PRICE'
+                            ? Math.max(0, unitPrice - Number(promo.discount_value))
+                            : Number(promo.discount_value);
                     const totalVal = val * available;
 
                     promoDiscount += totalVal;
