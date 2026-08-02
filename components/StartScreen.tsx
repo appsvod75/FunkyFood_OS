@@ -408,6 +408,8 @@ const StartScreen: React.FC<StartScreenProps> = ({
         try {
             return customers.filter(c => {
                 if (!c || typeof c !== 'object') return false;
+                // Only active customers can be assigned to new orders
+                if (c.isActive === false) return false;
                 const customerName = normalize(c.name);
                 const nameMatch = customerName.includes(safeSearchQuery);
 
@@ -475,6 +477,7 @@ const StartScreen: React.FC<StartScreenProps> = ({
 
             if (aiName || aiPhone) {
                 let existing = customers.find(c => {
+                    if (c.isActive === false) return false;
                     const cName = normalize(c.name);
                     const cPhone = c.phone ? c.phone.replace(/\D/g, '') : '';
                     const nameMatch = aiName && cName.includes(normalize(aiName));
@@ -1342,6 +1345,7 @@ const StartScreen: React.FC<StartScreenProps> = ({
                             if (aiName || aiPhone) {
                                 // Try simplified local search (Name OR Phone)
                                 let existing = customers.find(c => {
+                                    if (c.isActive === false) return false;
                                     const cName = normalize(c.name);
                                     const cPhone = c.phone ? c.phone.replace(/\D/g, '') : '';
 

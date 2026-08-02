@@ -132,6 +132,22 @@ const ManageCustomersScreen: React.FC<ManageCustomersScreenProps> = ({ customers
         setCustomerToDelete(id);
     };
 
+    const handleToggleActive = async (customer: Customer) => {
+        const nextActive = !(customer.isActive === undefined || customer.isActive);
+        try {
+            await api.setCustomerStatus(customer.id, nextActive);
+            setCustomers(prev => prev.map(c => c.id === customer.id ? { ...c, isActive: nextActive } : c));
+            setToast({
+                message: nextActive ? 'CLIENTE ACTIVADO' : 'CLIENTE DESACTIVADO',
+                title: '¡ÉXITO!',
+                type: 'success'
+            });
+        } catch (e) {
+            console.error("Error toggling customer status", e);
+            setToast({ message: 'ERROR AL CAMBIAR ESTADO', title: 'ERROR', type: 'error' });
+        }
+    };
+
     const confirmDeleteCustomer = async () => {
         if (!customerToDelete) return;
         const id = customerToDelete;
@@ -228,9 +244,21 @@ const ManageCustomersScreen: React.FC<ManageCustomersScreenProps> = ({ customers
                                 <div className="flex items-center gap-3 mt-0.5">
                                     <p className="text-gray-400 font-black text-[10px] tracking-widest">{formatPhone(customer.phone)}</p>
                                     <span className="text-gray-600 text-[9px] font-black uppercase tracking-widest bg-gray-800 px-1.5 py-0.5 rounded border border-gray-700/50">{customer.addresses?.length || 0} DIR</span>
+                                    {(customer.isActive === undefined || customer.isActive) ? (
+                                        <span className="text-green-600/80 text-[9px] font-black uppercase tracking-widest bg-green-900/10 px-1.5 py-0.5 rounded border border-green-700/30">ACTIVO</span>
+                                    ) : (
+                                        <span className="text-red-500/90 text-[9px] font-black uppercase tracking-widest bg-red-900/10 px-1.5 py-0.5 rounded border border-red-700/40">INACTIVO</span>
+                                    )}
                                 </div>
                             </div>
-                            <div className="flex gap-2 shrink-0">
+                            <div className="flex items-center gap-2 shrink-0">
+                                <button
+                                    onClick={() => handleToggleActive(customer)}
+                                    className={`relative w-11 h-6 rounded-full transition-colors active:scale-90 ${(customer.isActive === undefined || customer.isActive) ? 'bg-green-600' : 'bg-gray-700'}`}
+                                    title={(customer.isActive === undefined || customer.isActive) ? 'Desactivar' : 'Activar'}
+                                >
+                                    <span className={`absolute top-0.5 w-5 h-5 rounded-full bg-white shadow transition-all ${(customer.isActive === undefined || customer.isActive) ? 'left-[22px]' : 'left-0.5'}`} />
+                                </button>
                                 <button onClick={() => openModal(customer)} className="p-2 bg-gray-800 text-amber-500 rounded-xl border border-gray-700 hover:bg-amber-600 hover:border-amber-400 hover:text-white transition-all active:scale-90">
                                     <PencilIcon className="w-4 h-4" />
                                 </button>
@@ -509,6 +537,7 @@ const ManageCustomersScreen: React.FC<ManageCustomersScreenProps> = ({ customers
                 type={toast.type}
                 onClose={() => setToast({ ...toast, message: null })}
                 persistent={toast.type === 'error'}
+                position="top"
             />
         </div>
     );

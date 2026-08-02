@@ -174,6 +174,20 @@ The system supports **parallel cash sessions** (multiple OPEN sessions per branc
 - `handleConfirmPayment` arma `finalOrder.total = items + envío − promo` (sin cortesía) para el ticket.
 - **Files**: `App.tsx`, `components/OrderScreen.tsx`
 
+### 21. Clientes — Desactivar/Activar (no borrar) (Aug 2, 2026)
+- **Problema**: No había forma de desactivar clientes, solo borrar. La admin creó duplicados del mismo cliente por error y quería dejar uno solo sin perder el historial de ventas.
+- **Backend**:
+  - Auto-migración: `ALTER TABLE customers ADD COLUMN is_active BOOLEAN DEFAULT TRUE`.
+  - Nuevo endpoint `PUT /customers/:id/status` (body `{ isActive }`) → UPDATE `is_active`, emite `customers_updated`.
+  - `GET /customers` con `search`: ahora filtra `WHERE is_active = 1` (el AI parse no encuentra desactivados).
+  - `initial-data` mapea `c.isActive = !!c.is_active`.
+- **Frontend**:
+  - `types.ts`: campo `isActive?: boolean` en `Customer`.
+  - `api.ts`: método `setCustomerStatus(id, isActive)`.
+  - `ManageCustomersScreen.tsx`: switch verde/gris por cliente + badges **ACTIVO/INACTIVO**. Toast movido a `position="top"` (estaba abajo por defecto).
+  - `StartScreen.tsx`: `filteredCustomers` del wizard (paso cliente) y las 2 búsquedas `existing` del AI parse excluyen `c.isActive === false`.
+- **Convención**: los clientes con ventas pasadas no se borran, se desactivan; los desactivados no aparecen en el buscador de nuevas órdenes.
+
 ## Pending Actions & Recommendations
 - **[NUEVA TAREA] Combo editable por total — armado al vuelo (Aug 1, 2026)**: La admin quiere combos que la mesera **arme al vuelo**. Flujo: al seleccionar un combo de este tipo en el carrito → se abre un **modal** con botón "ARMAR COMBO", **búsqueda de productos** y campos de cantidad. La mesera agrega producto A x6, producto B x8, producto C xN, etc., **sin sobrepasar el total de unidades del combo** (ej. 24 cervezas), con el modal mostrando la **suma en vivo** de lo armado. Al confirmar, esas cantidades exactas son las que se **descuentan de inventario** (producto por producto, ya soportado por `combo_selections`). El combo incluye además un **alimento cobrado dentro del combo** que va a **cocina/KDS** como item real (línea KDS independiente con su propio completado).
   - **Especificación de configuración (AdminPanel)**: al marcar un producto como combo, agregar una **tercera opción "ARMABLE"** donde el admin **solo marca que es armable + define la cantidad total permitida** (ej. 24) **sin tener que definir qué productos lleva**. Guardar como tipo nuevo en `combo_definition` (JSON, ej. `{ type: 'editable', totalQty: 24 }`) — retrocompatible con los combos fijos/dinámicos existentes.
@@ -215,3 +229,8 @@ The system supports **parallel cash sessions** (multiple OPEN sessions per branc
 | `utils/promotionEngine.ts` | `isPromoActive`/`matchesItem`/`getItemPromoInfo` extraídos, hora/ventana nocturna El Salvador, `DISCOUNTABLE_TYPES` incluye COMBO |
 | `components/OrderScreen.tsx` | Badge promo + precio efectivo, `liveTotal`, PaymentModal con total en vivo, `finalOrder.total` sin cortesía |
 | `App.tsx` | `onCompleteOrder` recalcula `discount`/`total` con promos en vivo |
+| `server/routes.js` | Migración `is_active` en customers, `PUT /customers/:id/status`, `GET /customers` filtra inactivos en search, `initial-data` mapea `isActive` |
+| `components/ManageCustomersScreen.tsx` | Switch activar/desactivar + badges ACTIVO/INACTIVO, toast `position="top"` |
+| `components/StartScreen.tsx` | Buscador de cliente del wizard y AI parse excluyen `isActive === false` |
+| `api.ts` | `setCustomerStatus(id, isActive)` |
+| `types.ts` | `isActive?: boolean` en `Customer` |

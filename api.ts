@@ -235,6 +235,19 @@ export const api = {
         return this._delete(`/customers/${id}`);
     },
 
+    async setCustomerStatus(id: number, isActive: boolean) {
+        const res = await fetch(`${API_URL}/customers/${id}/status`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ isActive })
+        });
+        if (!res.ok) {
+            const txt = await res.text();
+            throw new Error(`Failed to update customer status: ${txt}`);
+        }
+        return res.json();
+    },
+
     async searchCustomers(query: string) {
         const res = await fetch(`${API_URL}/customers?search=${encodeURIComponent(query)}`);
         if (!res.ok) throw new Error('Search failed');

@@ -313,6 +313,26 @@ const parseProductJSON = (p) => {
     }
 })();
 
+// AUTO-MIGRATION: Add is_active to customers
+(async () => {
+    const conn = await pool.getConnection();
+    try {
+        await conn.query("SELECT is_active FROM customers LIMIT 1");
+    } catch (e) {
+        if (e.code === 'ER_BAD_FIELD_ERROR') {
+            console.log('Migrating: Adding is_active to customers...');
+            try {
+                await conn.query("ALTER TABLE customers ADD COLUMN is_active BOOLEAN DEFAULT TRUE");
+                console.log('Added is_active to customers.');
+            } catch (alterErr) {
+                console.error('Failed to add is_active:', alterErr);
+            }
+        }
+    } finally {
+        conn.release();
+    }
+})();
+
 
 // AUTO-MIGRATION: Create customer_feedback table
 (async () => {
@@ -1193,6 +1213,7 @@ router.get('/initial-data', async (req, res) => {
 
         customers.forEach(c => {
             c.addresses = addressMap[c.id] || [];
+            c.isActive = c.is_active === undefined || !!c.is_active;
             if (c.birth_date) {
                 try {
                     c.birthDate = new Date(c.birth_date).toISOString().split('T')[0];
@@ -3401,11 +3422,11 @@ router.get('/customers', async (req, res) => {
         const params = [];
 
         if (search) {
-            sql += ' WHERE name LIKE ? OR phone LIKE ?';
+            // Only active customers in search results (avoid picking deactivated duplicates)
+            sql += ' WHERE is_active = 1 AND (name LIKE ? OR phone LIKE ?)';
             params.push(`%${search}%`, `%${search}%`);
         } else {
             // Limit unrelated results if no search to avoid huge dumps (though initial-data does it)
-            // But usually this endpoint is for search.
             sql += ' LIMIT 100';
         }
 
@@ -3420,6 +3441,7 @@ router.get('/customers', async (req, res) => {
 
             customers.forEach(c => {
                 c.addresses = addresses.filter(a => a.customer_id === c.id);
+                c.isActive = c.is_active === undefined || !!c.is_active;
                 // Map camelCase for frontend consistency if needed, but StartScreen expects snake_case from initial-data?
                 // Wait, initial-data maps fields? No, it passes row data. 
                 // But Types define camelCase?
@@ -3575,7 +3597,19 @@ router.delete('/customers/:id', async (req, res) => {
     }
 });
 
-// --- PRODUCTS [VER: KDS-FIX-3] ---
+router.put('/customers/:id/status', async (req, res) => {
+    const { id } = req.params;
+    const { isActive } = req.body;
+    try {
+        const final = isActive ? 1 : 0;
+        const [result] = await pool.execute('UPDATE customers SET is_active = ? WHERE id = ?', [final, id]);
+        if (result.affectedRows === 0) return res.status(404).json({ error: 'Customer not found' });
+        req.io.emit('customers_updated');
+        res.json({ id: Number(id), isActive: !!final });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 router.post('/products', async (req, res) => {
     const b = req.body;
     const name = b.name;

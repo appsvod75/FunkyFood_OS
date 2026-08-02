@@ -184,6 +184,7 @@ export interface Customer {
     email?: string; // Added email field
     birthDate?: string; // YYYY-MM-DD
     addresses: Address[];
+    isActive?: boolean;
 }
 
 export interface OrderDetails {

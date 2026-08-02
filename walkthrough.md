@@ -659,3 +659,44 @@ Convención verificada (lo que se ve = lo que se guarda):
 | `utils/promotionEngine.ts` | Refactor, `DISCOUNTABLE_TYPES` con COMBO, `getItemPromoInfo`, El Salvador, ventanas nocturnas |
 | `components/OrderScreen.tsx` | Badge promo + precio efectivo, `liveTotal`, PaymentModal, `finalOrder.total` |
 | `App.tsx` | `onCompleteOrder` recalcula `discount`/`total` |
+
+---
+
+## 21. Clientes — Desactivar en vez de borrar (Aug 2, 2026)
+
+### Problema
+No había forma de desactivar clientes, solo borrar (DELETE). La admin creó duplicados del mismo cliente por error y quería dejar uno solo. Por regla general de integridad de datos, los clientes con ventas pasadas no deben borrarse (rompería historial), así que se implementa **desactivación**.
+
+### Backend — `server/routes.js`
+Auto-migración (igual que `birth_date`):
+```javascript
+ALTER TABLE customers ADD COLUMN is_active BOOLEAN DEFAULT TRUE
+```
+Nuevo endpoint:
+```javascript
+router.put('/customers/:id/status', async (req, res) => {
+    const { isActive } = req.body;
+    await pool.execute('UPDATE customers SET is_active = ? WHERE id = ?', [isActive ? 1 : 0, id]);
+    req.io.emit('customers_updated');
+    res.json({ id, isActive: !!isActive });
+});
+```
+`GET /customers` con `search` ahora filtra `WHERE is_active = 1` (el AI parse no devuelve desactivados). `initial-data` mapea `c.isActive = !!c.is_active`.
+
+### Frontend
+- `types.ts`: `isActive?: boolean` en `Customer`.
+- `api.ts`: `setCustomerStatus(id, isActive)` → PUT `/customers/:id/status`.
+- `ManageCustomersScreen.tsx`: switch verde/gris por cliente + badges **ACTIVO/INACTIVO**; toast movido a `position="top"` (por defecto el componente usa `bottom`).
+- `StartScreen.tsx`: el `filteredCustomers` del wizard (paso de cliente) y las 2 búsquedas `existing` del AI parse ahora excluyen `c.isActive === false`, para que las meseras no asignen clientes desactivados a órdenes nuevas.
+
+### Convención
+Los clientes con historial NO se borran: se desactivan. Los desactivados desaparecen del buscador de órdenes nuevas pero su historial permanece intacto en reportes/tickets.
+
+### Archivos
+| File | Change |
+|---|---|
+| `server/routes.js` | Migración `is_active`, `PUT /customers/:id/status`, `GET /customers` filtra inactivos en search |
+| `components/ManageCustomersScreen.tsx` | Switch activar/desactivar + badges ACTIVO/INACTIVO + toast top |
+| `components/StartScreen.tsx` | Buscador de cliente excluye inactivos |
+| `api.ts` | `setCustomerStatus()` |
+| `types.ts` | `isActive?` en `Customer` |
