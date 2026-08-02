@@ -912,8 +912,10 @@ router.post('/promotions', async (req, res) => {
     // instead of converting to UTC (which might shift the day back/forward).
     const formatDate = (d) => {
         if (!d) return null;
-        // If d is already just "YYYY-MM-DD", append T12:00:00 to force it to be treated as a date, 
-        // but better yet, handle full date objects.
+        // If d is already just "YYYY-MM-DD", keep it as-is with 00:00:00 to avoid
+        // timezone shifts (new Date("YYYY-MM-DD") parses as UTC).
+        if (/^\d{4}-\d{2}-\d{2}$/.test(String(d))) return `${String(d)} 00:00:00`;
+
         const date = new Date(d);
         if (isNaN(date.getTime())) return null;
 
@@ -926,7 +928,7 @@ router.post('/promotions', async (req, res) => {
         const minutes = pad(date.getMinutes());
         const seconds = pad(date.getSeconds());
 
-        return `${year} -${month} -${day} ${hours}:${minutes}:${seconds} `;
+        return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
     };
 
     try {

@@ -131,6 +131,18 @@ const PromotionsManager: React.FC<PromotionsManagerProps> = ({ promotions, setPr
         }
     };
 
+    const handleToggleActive = async (p: PromotionRule) => {
+        try {
+            const { is_active, ...rest } = p as any;
+            const payload = { ...rest, isActive: !p.isActive };
+            await api.updatePromotion(p.id, payload);
+            setPromotions(prev => prev.map(x => x.id === p.id ? { ...x, isActive: !x.isActive } : x));
+        } catch (e) {
+            console.error(e);
+            alert('Error al cambiar estado de promoción');
+        }
+    };
+
     const handleDelete = (id: number) => {
         setPromoToDelete(id);
     };
@@ -215,7 +227,14 @@ const PromotionsManager: React.FC<PromotionsManagerProps> = ({ promotions, setPr
                                     <span>{p.discount_type === 'PERCENTAGE' ? `${p.discount_value}% OFF` : p.discount_type === 'FIXED_PRICE' ? `A $${p.discount_value}` : `$${p.discount_value} OFF`}</span>
                                 </p>
                             </div>
-                            <div className="flex gap-2">
+                            <div className="flex items-center gap-2">
+                                <button
+                                    onClick={() => !mainScroll.isDragging && handleToggleActive(p)}
+                                    className={`relative w-12 h-7 rounded-full transition-colors active:scale-90 ${p.isActive ? 'bg-green-600' : 'bg-gray-700'}`}
+                                    title={p.isActive ? 'Desactivar' : 'Activar'}
+                                >
+                                    <span className={`absolute top-0.5 w-6 h-6 rounded-full bg-white shadow transition-all ${p.isActive ? 'left-[22px]' : 'left-0.5'}`} />
+                                </button>
                                 <button onClick={() => !mainScroll.isDragging && handleOpen(p)} className="p-2.5 bg-gray-800 text-amber-500 rounded-full border border-gray-700 hover:bg-amber-600 hover:border-amber-400 hover:text-white transition-all shadow-lg active:scale-90"><PencilIcon className="w-4 h-4" /></button>
                                 <button onClick={() => !mainScroll.isDragging && handleDelete(p.id)} className="p-2.5 bg-gray-800 text-red-500 rounded-full border border-gray-700 hover:bg-red-600 hover:border-red-400 hover:text-white transition-all shadow-lg active:scale-90"><TrashIcon className="w-4 h-4" /></button>
                             </div>
@@ -274,11 +293,11 @@ const PromotionsManager: React.FC<PromotionsManagerProps> = ({ promotions, setPr
                                     <div className="grid grid-cols-2 gap-4">
                                         <div className="space-y-1.5">
                                             <label className="text-[10px] font-black text-gray-500 uppercase tracking-widest ml-1 italic">Fecha Inicio</label>
-                                            <input type="date" value={form.start_date ? form.start_date.split('T')[0] : ''} onChange={e => setForm({ ...form, start_date: e.target.value })} className="w-full py-3 px-4 bg-gray-800 border-2 border-gray-700 rounded-2xl text-white font-black outline-none focus:border-amber-500 shadow-inner" />
+                                            <input type="date" value={form.start_date ? form.start_date.split(' ')[0].split('T')[0] : ''} onChange={e => setForm({ ...form, start_date: e.target.value })} className="w-full py-3 px-4 bg-gray-800 border-2 border-gray-700 rounded-2xl text-white font-black outline-none focus:border-amber-500 shadow-inner" />
                                         </div>
                                         <div className="space-y-1.5">
                                             <label className="text-[10px] font-black text-gray-500 uppercase tracking-widest ml-1 italic">Fecha Fin</label>
-                                            <input type="date" value={form.end_date ? form.end_date.split('T')[0] : ''} onChange={e => setForm({ ...form, end_date: e.target.value })} className="w-full py-3 px-4 bg-gray-800 border-2 border-gray-700 rounded-2xl text-white font-black outline-none focus:border-amber-500 shadow-inner" />
+                                            <input type="date" value={form.end_date ? form.end_date.split(' ')[0].split('T')[0] : ''} onChange={e => setForm({ ...form, end_date: e.target.value })} className="w-full py-3 px-4 bg-gray-800 border-2 border-gray-700 rounded-2xl text-white font-black outline-none focus:border-amber-500 shadow-inner" />
                                         </div>
                                         <div className="space-y-1.5">
                                             <label className="text-[10px] font-black text-gray-500 uppercase tracking-widest ml-1 italic">Hora Inicio</label>

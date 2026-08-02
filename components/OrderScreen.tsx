@@ -2,7 +2,7 @@
 import React, { useState, useMemo, useRef, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { Order, OrderItem, Product, Category, Meat, OrderType, ProductExtra, Payment, CompanySettings, Branch, PaymentMethod, UserRole, PromotionRule, Waiter } from '../types';
-import { calculatePromotions } from '../utils/promotionEngine';
+import { calculatePromotions, getItemPromoInfo } from '../utils/promotionEngine';
 import { CLIENTE_VARIOS } from '../constants';
 import TicketModal from './TicketModal';
 import PaymentModal from './PaymentModal';
@@ -130,6 +130,12 @@ const OrderScreen: React.FC<OrderScreenProps> = ({
     const [itemForExtras, setItemForExtras] = useState<OrderItem | null>(null);
     const [completedOrderForTicket, setCompletedOrderForTicket] = useState<Order | null>(null);
     const [manualDiscount, setManualDiscount] = useState(0);
+    // LIVE total: sum items + delivery - promo discounts - manual discount (keeps breakdown and total in sync)
+    const liveTotal = useMemo(() => {
+        const itemsTotal = order.items.reduce((s, i) => s + i.total, 0);
+        const discountTotal = appliedDiscounts.reduce((s, d) => s + d.amount, 0);
+        return Math.max(0, itemsTotal + (order.deliveryFee || 0) - discountTotal - manualDiscount);
+    }, [order.items, appliedDiscounts, order.deliveryFee, manualDiscount]);
     // Optimization: Land on Cart if there are items, Menu if empty
     const [mobileView, setMobileView] = useState<'menu' | 'summary'>(order.items.length > 0 ? 'summary' : 'menu');
     const [addedFeedback, setAddedFeedback] = useState<string | null>(null);
@@ -293,8 +299,12 @@ const OrderScreen: React.FC<OrderScreenProps> = ({
         try {
             const receiverName = currentUser?.username || 'Sistema';
 
+            const discountTotal = appliedDiscounts.reduce((s, d) => s + d.amount, 0);
+            const promoOnlyTotal = Math.max(0, order.items.reduce((s, i) => s + i.total, 0) + (order.deliveryFee || 0) - discountTotal);
+
             const finalOrder: Order = {
                 ...order,
+                total: promoOnlyTotal,
                 manualDiscount: manualDiscount, // Send the manual discount
                 serviceCharge: serviceCharge,
                 cardCommission: cardCommission,
@@ -748,11 +758,18 @@ const OrderScreen: React.FC<OrderScreenProps> = ({
                             </div>
                         ) : (
                             <div className="space-y-1.5">
-                                {order.items.map(item => (
+                                {order.items.map(item => {
+                                    const promoInfo = getItemPromoInfo(item, promotions);
+                                    return (
                                     <div key={item.id} className="bg-gray-800 rounded-[18px] pt-2.5 px-2.5 pb-2 border border-gray-700 relative group">
                                         <div className="flex justify-between items-start mb-1.5">
                                             <div className="flex-1 min-w-0 pr-3">
                                                 <p className="font-black text-[15px] text-white leading-tight uppercase truncate tracking-tight group-active:text-amber-400">{item.product.name}</p>
+                                                {promoInfo && (
+                                                    <p className="text-[9px] font-black text-green-400 uppercase tracking-widest italic mt-1 inline-flex items-center gap-1 bg-green-900/20 border border-green-500/30 rounded-full px-2 py-0.5">
+                                                        <TagIcon className="w-3 h-3" /> {promoInfo.promoName}
+                                                    </p>
+                                                )}
                                                 {/* COMBO DETAILS */}
                                                 {item.comboSelections && item.comboSelections.length > 0 && (
                                                     <div className="pl-2 mt-1 space-y-0.5 border-l-2 border-purple-500/30">
@@ -777,7 +794,16 @@ const OrderScreen: React.FC<OrderScreenProps> = ({
                                                     </div>
                                                 )}
                                             </div>
-                                            <p className="font-black text-base text-amber-500 italic tracking-tighter leading-none">${item.total.toFixed(2)}</p>
+                                            <div className="text-right shrink-0">
+                                                {promoInfo ? (
+                                                    <>
+                                                        <p className="font-black text-base text-green-400 italic tracking-tighter leading-none">${(promoInfo.unitPrice * promoInfo.quantity).toFixed(2)}</p>
+                                                        <p className="text-[9px] text-gray-500 italic line-through leading-tight">${item.total.toFixed(2)}</p>
+                                                    </>
+                                                ) : (
+                                                    <p className="font-black text-base text-amber-500 italic tracking-tighter leading-none">${item.total.toFixed(2)}</p>
+                                                )}
+                                            </div>
                                         </div>
 
                                         <div className="flex items-center justify-between">
@@ -839,7 +865,8 @@ const OrderScreen: React.FC<OrderScreenProps> = ({
                                             </div>
                                         </div>
                                     </div>
-                                ))}
+                                    );
+                                })}
                             </div>
                         )}
                     </div>
@@ -891,7 +918,7 @@ const OrderScreen: React.FC<OrderScreenProps> = ({
                         {/* TOTAL ARRIBA */}
                         <div className="flex justify-between items-end mb-4 px-1">
                             <span className="text-xs font-black text-gray-500 uppercase tracking-[0.25em] italic">TOTAL A PAGAR</span>
-                            <span className="text-3xl font-black text-amber-500 italic tracking-tighter leading-none">${(order.total - manualDiscount).toFixed(2)}</span>
+                            <span className="text-3xl font-black text-amber-500 italic tracking-tighter leading-none">${liveTotal.toFixed(2)}</span>
                         </div>
 
                         {/* FILA DE BOTONES ABAJO */}
@@ -1071,7 +1098,7 @@ const OrderScreen: React.FC<OrderScreenProps> = ({
             {
                 isPaymentModalVisible && (
                     <PaymentModal
-                        orderTotal={order.total}
+                        orderTotal={liveTotal + manualDiscount}
                         manualDiscount={manualDiscount}
                         onManualDiscountChange={setManualDiscount}
                         onClose={() => setIsPaymentModalVisible(false)}

@@ -1408,6 +1408,10 @@ const App: React.FC = () => {
                     }, 1000);
 
                 }} onCompleteOrder={async (id, payments, change, manualDiscount, serviceCharge, cardCommission) => {
+                    const finalDiscounts = calculatePromotions(activeOrder!.items, promotions);
+                    const finalDiscountTotal = finalDiscounts.reduce((s, d) => s + d.amount, 0);
+                    const finalTotal = Math.max(0, activeOrder!.items.reduce((s, i) => s + i.total, 0) + (activeOrder!.deliveryFee || 0) - finalDiscountTotal);
+
                     const updatedOrder = {
                         ...activeOrder!,
                         status: 'completed' as const,
@@ -1415,6 +1419,8 @@ const App: React.FC = () => {
                         payments,
                         amountPaid: payments.reduce((s, p) => s + p.amount, 0),
                         changeGiven: change,
+                        total: finalTotal,
+                        discount: finalDiscountTotal,
                         manualDiscount: manualDiscount || activeOrder?.manualDiscount || 0,
                         serviceCharge: serviceCharge || activeOrder?.serviceCharge || 0,
                         cardCommission: cardCommission || activeOrder?.cardCommission || 0,

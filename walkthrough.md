@@ -589,3 +589,73 @@ async deleteCashClosing(id: number) {
 | `server/routes.js` | `DELETE /cash-closing/:id` endpoint |
 | `api.ts` | `deleteCashClosing()` method |
 | `CashClosingScreen.tsx` | Sort OPEN first en existingReport + botón papelera con PIN + delete handler |
+
+---
+
+## 20. Promociones — Fix POST 500, Toggle, Precio Fijo en Carrito y Total en Vivo (Aug 1, 2026)
+
+### Problema 1 — `POST /promotions` devolvía 500
+`formatDate` construía el datetime con espacios sueltos:
+```javascript
+return `${year} -${month} -${day} ${hours}:${minutes}:${seconds} `;
+//        "2026 -07 -31 18:00:00 "  →  MySQL: Incorrect datetime value
+```
+**Fix**: `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`. Además, si el valor es `YYYY-MM-DD` puro (viene del `input type="date"`), se usa tal cual con `00:00:00` para evitar que `new Date("YYYY-MM-DD")` (que parsea UTC) corra el día hacia atrás en UTC-6.
+
+### Problema 2 — No había toggle activar/desactivar
+Solo se podía eliminar (soft-delete). Se agregó un switch en cada fila:
+```tsx
+const { is_active, ...rest } = p as any;
+const payload = { ...rest, isActive: !p.isActive };
+await api.updatePromotion(p.id, payload);
+```
+Se descarta `is_active` porque el backend prioriza `is_active` sobre `isActive` (el GET devuelve ambos).
+
+### Problema 3 — Fechas no editables al editar promo
+`dateStrings: true` en `db.js` → el GET devuelve `start_date` como `"2026-07-31 00:00:00"` (con espacio, sin `T`). Los inputs usaban `.split('T')[0]` → valor inválido. Fix: `.split(' ')[0].split('T')[0]`.
+
+### Problema 4 — Badge de promo visible pero el total no descontaba (tipo COMBO)
+Dos funciones con lógica divergente:
+- `getItemPromoInfo` (badge): mostraba cualquier tipo excepto `QUANTITY`.
+- `calculatePromotions` (total): solo procesaba `QUANTITY` + `['HAPPY_HOUR','EVENT','CATEGORY','GLOBAL','BIRTHDAY']`.
+
+Una promo tipo **COMBO** con precio fijo mostraba el badge verde pero `discountTotal = 0`. Fix: constante compartida `DISCOUNTABLE_TYPES = [..., 'COMBO']` usada por ambas.
+
+### Problema 5 — Breakdown muestra descuento pero el TOTAL no lo resta
+`appliedDiscounts` se recalcula en vivo (`useMemo` sobre `order.items` y `promotions`), pero el total usaba `order.total` persistido, que no se actualizaba si la promo se activaba después de agregar ítems.
+
+**Fix `liveTotal`** en OrderScreen:
+```typescript
+const liveTotal = useMemo(() => {
+    const itemsTotal = order.items.reduce((s, i) => s + i.total, 0);
+    const discountTotal = appliedDiscounts.reduce((s, d) => s + d.amount, 0);
+    return Math.max(0, itemsTotal + (order.deliveryFee || 0) - discountTotal - manualDiscount);
+}, [order.items, appliedDiscounts, order.deliveryFee, manualDiscount]);
+```
+PaymentModal recibe `orderTotal={liveTotal + manualDiscount}` (el modal resta la cortesía internamente).
+
+### Problema 6 — Consistencia DB al cobrar
+`onCompleteOrder` guardaba `activeOrder.total` (viejo). Ahora recalcula con las promos en vivo:
+```typescript
+const finalDiscountTotal = finalDiscounts.reduce((s, d) => s + d.amount, 0);
+const finalTotal = Math.max(0, items + deliveryFee - finalDiscountTotal);
+```
+Convención verificada (lo que se ve = lo que se guarda):
+- Carrito TOTAL A PAGAR = `items + envío − promo − cortesía`
+- Ticket = `total − cortesía + propina + comisión` (el `total` del ticket no incluye cortesía)
+- DB `total` = `items + envío − promo` (la cortesía va en `manual_discount`)
+- Reportes = `SUM(total − manual_discount)` ✓
+
+### Cambios adicionales
+- `isPromoActive()` / `matchesItem()` / `getItemPromoInfo()` extraídos en `promotionEngine.ts`.
+- Hora/día del engine usan El Salvador (`getElSalvadorDateString` + `Intl.DateTimeFormat('America/El_Salvador')`).
+- Ventanas nocturnas: `end_time < start_time` cruza medianoche (06:00→01:00 cubre el día + madrugada).
+
+### Archivos
+| File | Change |
+|---|---|
+| `server/routes.js` | `formatDate` corregido + preserva `YYYY-MM-DD` |
+| `components/PromotionsManager.tsx` | Toggle activar/desactivar + inputs fecha |
+| `utils/promotionEngine.ts` | Refactor, `DISCOUNTABLE_TYPES` con COMBO, `getItemPromoInfo`, El Salvador, ventanas nocturnas |
+| `components/OrderScreen.tsx` | Badge promo + precio efectivo, `liveTotal`, PaymentModal, `finalOrder.total` |
+| `App.tsx` | `onCompleteOrder` recalcula `discount`/`total` |

@@ -1,4 +1,5 @@
 import { PromotionRule, OrderItem } from '../types';
+import { getElSalvadorDateString } from './dates';
 
 export interface AppliedDiscount {
     promotionId: number;
@@ -7,39 +8,93 @@ export interface AppliedDiscount {
     description: string;
 }
 
+const SV_TIMEZONE = 'America/El_Salvador';
+
+// Promo types that apply a per-item discount (handled identically in getItemPromoInfo and calculatePromotions)
+const DISCOUNTABLE_TYPES = ['HAPPY_HOUR', 'EVENT', 'CATEGORY', 'GLOBAL', 'BIRTHDAY', 'COMBO'];
+
+export const isPromoActive = (p: PromotionRule, now: Date = new Date()): boolean => {
+    if (!p.isActive) return false;
+
+    // Use El Salvador date string YYYY-MM-DD
+    const currentDateStr = getElSalvadorDateString();
+
+    if (p.start_date) {
+        const startDateStr = String(p.start_date).split(' ')[0].split('T')[0];
+        if (startDateStr > currentDateStr) return false;
+    }
+    if (p.end_date) {
+        const endDateStr = String(p.end_date).split(' ')[0].split('T')[0];
+        if (endDateStr < currentDateStr) return false;
+    }
+
+    if (p.days_of_week && p.days_of_week.length > 0 && !p.days_of_week.includes(now.getDay())) return false;
+
+    const timeFormatter = new Intl.DateTimeFormat('en-GB', {
+        timeZone: SV_TIMEZONE,
+        hour: '2-digit',
+        minute: '2-digit',
+    });
+    const currentTimeStr = timeFormatter.format(now); // "14:30"
+    if (p.start_time) {
+        if (p.end_time && p.end_time < p.start_time) {
+            // Overnight window (crosses midnight): active from start_time to 23:59 OR 00:00 to end_time
+            const insideOvernight = currentTimeStr >= p.start_time || currentTimeStr <= p.end_time;
+            if (!insideOvernight) return false;
+        } else if (currentTimeStr < p.start_time) {
+            return false;
+        }
+    }
+    if (p.end_time && !(p.end_time < p.start_time) && currentTimeStr > p.end_time) return false;
+
+    return true;
+};
+
+export const matchesItem = (p: PromotionRule, item: OrderItem): boolean => {
+    if (p.target_type === 'GLOBAL') return true;
+    if (p.target_type === 'PRODUCT') return (p.target_ids || []).includes(item.product.id);
+    if (p.target_type === 'CATEGORY') return (p.target_ids || []).includes(item.product.categoryId);
+    return false;
+};
+
+export interface ItemPromoInfo {
+    promoName: string;
+    promoId: number;
+    unitPrice: number;
+    quantity: number;
+}
+
+export const getItemPromoInfo = (item: OrderItem, promotions: PromotionRule[]): ItemPromoInfo | null => {
+    const unitPrice = item.quantity > 0 ? item.total / item.quantity : 0;
+    const active = promotions
+        .filter(p => isPromoActive(p) && DISCOUNTABLE_TYPES.includes(p.type))
+        .sort((a, b) => b.priority - a.priority);
+
+    for (const promo of active) {
+        if (!matchesItem(promo, item)) continue;
+
+        const effective = promo.discount_type === 'PERCENTAGE'
+            ? unitPrice * (1 - Number(promo.discount_value) / 100)
+            : promo.discount_type === 'FIXED_PRICE'
+                ? Math.min(unitPrice, Number(promo.discount_value))
+                : Math.max(0, unitPrice - Number(promo.discount_value));
+
+        return {
+            promoName: promo.name,
+            promoId: promo.id,
+            unitPrice: effective,
+            quantity: item.quantity,
+        };
+    }
+    return null;
+};
+
 export const calculatePromotions = (items: OrderItem[], promotions: PromotionRule[]): AppliedDiscount[] => {
     const discounts: AppliedDiscount[] = [];
     const now = new Date();
 
     // 1. Filter active promotions based on rules
-    const activePromos = promotions.filter(p => {
-        if (!p.isActive) return false;
-
-        // Use local date string YYYY-MM-DD
-        const year = now.getFullYear();
-        const month = String(now.getMonth() + 1).padStart(2, '0');
-        const day = String(now.getDate()).padStart(2, '0');
-        const currentDateStr = `${year}-${month}-${day}`;
-
-        if (p.start_date) {
-            // p.start_date is likely "YYYY-MM-DD HH:mm:ss" or "YYYY-MM-DD". 
-            // We only care about the date part.
-            const startDateStr = String(p.start_date).split(' ')[0].split('T')[0];
-            if (startDateStr > currentDateStr) return false;
-        }
-        if (p.end_date) {
-            const endDateStr = String(p.end_date).split(' ')[0].split('T')[0];
-            if (endDateStr < currentDateStr) return false;
-        }
-
-        if (p.days_of_week && p.days_of_week.length > 0 && !p.days_of_week.includes(now.getDay())) return false;
-
-        const currentTimeStr = now.toTimeString().slice(0, 5); // "14:30"
-        if (p.start_time && currentTimeStr < p.start_time) return false;
-        if (p.end_time && currentTimeStr > p.end_time) return false;
-
-        return true;
-    }).sort((a, b) => b.priority - a.priority);
+    const activePromos = promotions.filter(p => isPromoActive(p, now)).sort((a, b) => b.priority - a.priority);
 
     // 2. Track consumed quantity per item
     const consumedMap = new Map<string, number>(); // itemId -> consumedQuantity
@@ -48,10 +103,7 @@ export const calculatePromotions = (items: OrderItem[], promotions: PromotionRul
     // Helper to get eligible items that have remaining quantity
     const getEligibleItems = (rule: PromotionRule) => {
         return items.filter(i => {
-            let match = false;
-            if (rule.target_type === 'GLOBAL') match = true;
-            else if (rule.target_type === 'PRODUCT') match = (rule.target_ids || []).includes(i.product.id);
-            else if (rule.target_type === 'CATEGORY') match = (rule.target_ids || []).includes(i.product.categoryId);
+            const match = matchesItem(rule, i);
 
             if (!match) return false;
 
@@ -121,7 +173,7 @@ export const calculatePromotions = (items: OrderItem[], promotions: PromotionRul
                 });
             }
 
-        } else if (['HAPPY_HOUR', 'EVENT', 'CATEGORY', 'GLOBAL', 'BIRTHDAY'].includes(promo.type)) {
+        } else if (DISCOUNTABLE_TYPES.includes(promo.type)) {
             const eligible = getEligibleItems(promo);
             let promoDiscount = 0;
 

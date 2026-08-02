@@ -142,6 +142,38 @@ The system supports **parallel cash sessions** (multiple OPEN sessions per branc
 - **Isolated Data**: Orders, Cash Reports, Tables are branch-specific.
 - **Action Plan**: Create a second Branch, assign Admin, replicate tables.
 
+## Recent Work — Promociones (Aug 1, 2026)
+
+### 16. Fix POST /promotions 500 — `formatDate` malformado
+- **Problema**: `formatDate` en `POST /promotions` construía el datetime con espacios: `2026 -07 -31 18:00:00 ` → MySQL lo rechazaba con `Incorrect datetime value`.
+- **Fix**: `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`. Además, si el valor es `YYYY-MM-DD` puro se usa tal cual con `00:00:00` (evita corrimiento de día por `new Date("YYYY-MM-DD")` que parsea UTC en huso -06:00).
+- **File**: `server/routes.js`
+
+### 17. PromotionsManager — Toggle Activar/Desactivar
+- **Problema**: Solo se podía eliminar (soft-delete `is_active=0`) y no revivir.
+- **Fix**: Switch verde/off en cada fila que llama `api.updatePromotion(id, { isActive: !p.isActive })`. Descarta `is_active` del payload porque el backend prioriza `is_active` sobre `isActive`.
+- **Fix inputs fecha**: El GET devuelve `2026-07-31 00:00:00` (con espacio, `dateStrings: true`), pero los inputs usaban `.split('T')[0]` → valor inválido al editar. Ahora cortan por espacio o `T`.
+- **File**: `components/PromotionsManager.tsx`
+
+### 18. promotionEngine — Refactor + Precio por ítem + Total en vivo
+- **`isPromoActive()`** extraído: usa fecha El Salvador (`getElSalvadorDateString`) y hora El Salvador (`Intl.DateTimeFormat` con `America/El_Salvador`), en vez de `new Date()` local del dispositivo.
+- **`matchesItem()`** extraído: lógica de target PRODUCT/CATEGORY/GLOBAL.
+- **Ventanas nocturnas**: si `end_time < start_time` la ventana cruza medianoche (ej. 06:00→01:00 cubre todo el día + madrugada, brecha 1:00–6:00).
+- **`getItemPromoInfo()`** nuevo: devuelve precio efectivo por ítem para badge en carrito.
+- **`DISCOUNTABLE_TYPES`** unificado: `['HAPPY_HOUR','EVENT','CATEGORY','GLOBAL','BIRTHDAY','COMBO']`. Antes `calculatePromotions` no procesaba `COMBO`, así que una promo tipo COMBO con precio fijo mostraba badge pero NO descontaba el total.
+- **File**: `utils/promotionEngine.ts`
+
+### 19. Carrito — Badge de promo + precio efectivo
+- Cada ítem del carrito muestra badge verde con el nombre de la promo, precio efectivo (ej. $1.25) y precio normal tachado.
+- **`liveTotal`** en OrderScreen: total calculado en vivo `items + envío − promo − cortesía`. Antes se usaba `order.total` persistido que quedaba desactualizado si la promo se activaba después de agregar ítems (el breakdown mostraba el descuento pero el total no lo restaba).
+- **PaymentModal**: recibe `orderTotal={liveTotal + manualDiscount}` (el modal resta la cortesía internamente).
+- **File**: `components/OrderScreen.tsx`
+
+### 20. Cobro — Total recalculado al completar
+- `onCompleteOrder` en App.tsx **recalcula** `discountTotal` y `total` con `calculatePromotions` en vivo al cobrar (en vez de usar `activeOrder.total` potencialmente viejo). El `total` guardado en DB **no incluye la cortesía** (va en `manual_discount`, consistente con reportes `SUM(total - manual_discount)` y el ticket).
+- `handleConfirmPayment` arma `finalOrder.total = items + envío − promo` (sin cortesía) para el ticket.
+- **Files**: `App.tsx`, `components/OrderScreen.tsx`
+
 ## Pending Actions & Recommendations
 - **[NUEVA TAREA] Combo editable por total — armado al vuelo (Aug 1, 2026)**: La admin quiere combos que la mesera **arme al vuelo**. Flujo: al seleccionar un combo de este tipo en el carrito → se abre un **modal** con botón "ARMAR COMBO", **búsqueda de productos** y campos de cantidad. La mesera agrega producto A x6, producto B x8, producto C xN, etc., **sin sobrepasar el total de unidades del combo** (ej. 24 cervezas), con el modal mostrando la **suma en vivo** de lo armado. Al confirmar, esas cantidades exactas son las que se **descuentan de inventario** (producto por producto, ya soportado por `combo_selections`). El combo incluye además un **alimento cobrado dentro del combo** que va a **cocina/KDS** como item real (línea KDS independiente con su propio completado).
   - **Especificación de configuración (AdminPanel)**: al marcar un producto como combo, agregar una **tercera opción "ARMABLE"** donde el admin **solo marca que es armable + define la cantidad total permitida** (ej. 24) **sin tener que definir qué productos lleva**. Guardar como tipo nuevo en `combo_definition` (JSON, ej. `{ type: 'editable', totalQty: 24 }`) — retrocompatible con los combos fijos/dinámicos existentes.
@@ -178,3 +210,8 @@ The system supports **parallel cash sessions** (multiple OPEN sessions per branc
 | `components/AuditLogsScreen.tsx` | Default date range with El Salvador |
 | `components/ChefStatsModal.tsx` | Default date range with El Salvador |
 | `components/PaymentControl.tsx` | Due date calculations with El Salvador, grace days `||` → `??` + string state + input editable |
+| `server/routes.js` | `formatDate` corregido (sin espacios, preserva `YYYY-MM-DD` puro) |
+| `components/PromotionsManager.tsx` | Toggle activar/desactivar, inputs fecha cortan por espacio/`T` |
+| `utils/promotionEngine.ts` | `isPromoActive`/`matchesItem`/`getItemPromoInfo` extraídos, hora/ventana nocturna El Salvador, `DISCOUNTABLE_TYPES` incluye COMBO |
+| `components/OrderScreen.tsx` | Badge promo + precio efectivo, `liveTotal`, PaymentModal con total en vivo, `finalOrder.total` sin cortesía |
+| `App.tsx` | `onCompleteOrder` recalcula `discount`/`total` con promos en vivo |
